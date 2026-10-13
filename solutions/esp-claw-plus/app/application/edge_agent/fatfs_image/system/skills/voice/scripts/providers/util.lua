@@ -148,8 +148,11 @@ end
 -- POST 一个请求。成功返回 status(number), body(string);
 -- 失败返回 nil, err(string), detail(string)。
 -- opts: url / headers / body / timeout_ms / max_body_bytes /
---       save_path / max_file_bytes / source_cap / max_output_bytes
--- 说明: 设置 save_path 时 cap_http_request 会把完整响应体落盘, body 仅保留摘要。
+--       save_path / max_file_bytes / decode_base64_field / source_cap /
+--       max_output_bytes
+-- 说明: 设置 save_path 时 cap_http_request 会把完整响应体落盘, body 仅保留摘要;
+--       若同时给出 decode_base64_field, 则 C 侧从响应流里增量提取该字段的 base64
+--       值并逐块解码, 直接把音频字节写入 save_path (无需中间落盘与上层解码)。
 -- ---------------------------------------------------------------------------
 function M.http_post(opts)
     local capability = require("capability")
@@ -162,6 +165,7 @@ function M.http_post(opts)
         max_body_bytes = opts.max_body_bytes or 16384,
         save_path = opts.save_path,
         max_file_bytes = opts.max_file_bytes,
+        decode_base64_field = opts.decode_base64_field,
     }, { source_cap = opts.source_cap or "voice", max_output_bytes = opts.max_output_bytes or 32768 })
 
     if not call_ok then

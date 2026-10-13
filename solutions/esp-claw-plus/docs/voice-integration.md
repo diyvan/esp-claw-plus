@@ -47,7 +47,8 @@ BOOT 键按下 → 录音(WAV) → [ASR] → 文本注入渠道层 → Agent Loo
 |---|---|---|
 | `app/application/edge_agent/fatfs_image/system/skills/voice/SKILL.md` | `/system` | 技能声明（**必须有 JSON frontmatter**，见 §5 教训） |
 | `.../system/skills/voice/scripts/voice_ptt.lua` | `/system` | 常驻 PTT 循环：GPIO35 按下 → 录音 → ASR → `ep.publish_message` 注入 `voice/voice`（ASR 端点/密钥 + `voice_enabled`/`voice_wake_enabled` 门控读运行时 JSON） |
-| `.../system/skills/voice/scripts/voice_reply.lua` | `/system` | 回复播报：`args.text` → [TTS]（端点为空则放弃播报，不播提示音；TTS 端点/密钥读运行时 JSON） |
+| `.../system/skills/voice/scripts/voice_reply.lua` | `/system` | 回复播报（非流式回退路径）：`args.text` → [TTS]（端点为空则放弃播报，不播提示音；TTS 端点/密钥读运行时 JSON） |
+| `.../system/skills/voice/scripts/voice_tts.lua` | `/system` | TTS **共享合成模块**：`synthesize(cfg, text, out_base, root_dir)`（落盘回退路径）+ `stream_request(cfg, text)`（返回流式请求描述，供边收边播，见 §7.3），被 `voice_reply.lua` 与 `voice_ptt.lua` 的句子级流水线复用（generic 端点或 provider 分派，见 §7） |
 | `.../system/skills/voice/scripts/voice_selftest.lua` | `/system` | 录音+回放自检（不依赖按键），验证 ES8311 输入/输出通路 |
 | `.../system/skills/voice/scripts/providers/*.lua` | `/system` | 云端服务适配层（供应商插件）：`util.lua` 公共工具 + `asr_volcano.lua` / `tts_volcano.lua` 火山引擎适配器，见 §6.3 |
 | `.../system/font/font_puhui_common_14_1.bin` | `/system` | 全量常用字 CJK 字体（272KB），供面板显示中文 |
@@ -55,6 +56,9 @@ BOOT 键按下 → 录音(WAV) → [ASR] → 文本注入渠道层 → Agent Loo
 | `scripts/install_voice_rules.py` | 主机侧 | 经串口 REPL 用 `event_router --add-rule-json` 安装规则 |
 | `patches/esp-claw-display-owner.patch` | esp-claw 补丁 | 修 `lua_module_display` 退出钩子误释放面板持有的屏幕（详见 §4.1） |
 | `patches/esp-claw-ha-voice-config.patch` | esp-claw 补丁 | 加 `ha_enabled` + `voice` 组配置字段，并在 `main.c` 保存配置后调 `ha_panel_publish_runtime_config()` 写运行时 JSON |
+| `patches/esp-claw-voice-latency.patch` | esp-claw 补丁 | 延迟优化①③：`voice` 渠道注入「简短回复」系统提示（`claw_core_context.c`）+ `cap_http_request` 新增 `decode_base64_field` 字段级流式解码下沉（去掉 FATFS raw-JSON 中转与纯 Lua 解码），见 §7 |
+| `patches/esp-claw-llm-stream.patch` | esp-claw 补丁 | 延迟优化④：LLM 流式 SSE（transport 增量解析 + delta 回调 + `out_message_delta` 落盘桥接），见 §7 |
+| `patches/esp-claw-tts-stream.patch` | esp-claw 补丁 | 延迟优化②：新增 `cap_tts_stream` 组件（HTTP 流式 + base64 增量解码 + StreamBuffer）并为 `audio.player` 增 `play_stream`（`raw://` 输入回调拉取），见 §7.3 |
 
 > **运行时配置桥**：`/fatfs/ha_voice_runtime.json` 由 C 侧（`ha_panel.c`）写出，字段 `ha_enabled` /
 > `voice_enabled` / `ha_base_url` / `ha_token` / `voice_wake_enabled` / `voice_asr_provider` /
@@ -353,7 +357,7 @@ $IDF_PYTHON_ENV_PATH/bin/python solutions/ha_ai_panel/scripts/install_voice_rule
 |---|---|---|
 | `.../voice/scripts/providers/util.lua` | `/system` | 供应商公共工具：`base64_encode` / `base64_decode`（流式，防浮点精度丢失）/ `json_escape` / `uuid` / `http_post`（包装 `capability.call("http_request", ...)`，解析 `HTTP <status>\n<body>`） |
 | `.../voice/scripts/providers/asr_volcano.lua` | `/system` | 火山引擎 ASR 适配器，导出流式会话 `open(cfg, info)` → 会话对象（`send` / `poll` / `finish` / `abort`）或 `nil, reason` |
-| `.../voice/scripts/providers/tts_volcano.lua` | `/system` | 火山引擎 TTS 适配器，导出 `synthesize(cfg, text, out_path, root_dir)` → `true` 或 `false, reason`，外加 `default_ext` |
+| `.../voice/scripts/providers/tts_volcano.lua` | `/system` | 火山引擎 TTS 适配器，导出 `synthesize(cfg, text, out_path, root_dir)` → `true` 或 `false, reason`，外加 `default_ext`；另导出 `stream_request(cfg, text)` → 流式请求描述（url/headers/body/timeout_ms，见 §7.3） |
 
 > `reason` 为给面板状态行用的简短中文失败原因（如 `未配置 ASR 密钥` / `ASR HTTP 401` /
 > `TTS 无音频返回`），调用方（`voice_ptt.lua` / `voice_reply.lua`）用 `set_error()` 写
@@ -373,7 +377,7 @@ $IDF_PYTHON_ENV_PATH/bin/python solutions/ha_ai_panel/scripts/install_voice_rule
   类型需匹配 — 否则 WS 握手会返回 403。
 - **TTS**：大模型语音合成 **V3 单向流式** `POST https://openspeech.bytedance.com/api/v3/tts/unidirectional`，
   header `X-Api-Key` / `X-Api-Resource-Id`（默认 `seed-tts-2.0`）/ `X-Api-Request-Id`；body
-  `req_params.text` + `speaker`（默认 `zh_female_vv_uranus_bigtts`，Vivi 2.0）+ `audio_params`（mp3 / 24000Hz）。
+  `req_params.text` + `speaker`（默认 `zh_female_vv_uranus_bigtts`，Vivi 2.0）+ `audio_params`（mp3 / **16000Hz**）。
   响应为 chunked 流式 JSON，音频为 base64 分块——先经 `http_request` 的 `save_path` 全量落盘，
   再在 Lua 内**逐块解码后拼接字节**（不能拼 base64 字符串，分块各自补齐会损坏），写出
   `/fatfs/voice_reply.mp3` 后播放（`default_ext = "mp3"`）。
@@ -383,3 +387,207 @@ $IDF_PYTHON_ENV_PATH/bin/python solutions/ha_ai_panel/scripts/install_voice_rule
 
 > 说明：**resource_id / speaker 留空时由 provider 取内置默认值**，故配置页可不填即可先跑通；
 > 需要切换不同模型/音色时再在配置页填写。
+
+---
+
+## 7. 端到端延迟优化（逐项落地）
+
+语音链路为「PTT 松开 → ASR → Agent(LLM) → TTS → 播放」，耗时集中在 **LLM 首字**与
+**TTS 首帧**。按 7 项优化清单逐项落地，状态如下（✅ 已落地并编译通过 / ⏳ 未开始）：
+
+| # | 优化项 | 落地方式 | 状态 |
+|---|---|---|---|
+| ① | 回复更短（减少 LLM 输出 token） | `claw_core_context.c`：`voice` 渠道注入「简短口语回复」系统提示 | ✅（补丁 `esp-claw-voice-latency.patch`） |
+| ② | TTS 真·边收边播 | 新增 `cap_tts_stream` 组件（HTTP 流式 + base64 增量解码 + StreamBuffer）+ `audio.player:play_stream`（`raw://` 输入回调）；Lua 侧 `voice_tts.stream_request` 分派、`voice_ptt` 流式优先播报；**开关 = `/fatfs/voice_tts_stream` 标记文件**（见 §7.3） | ✅（补丁 `esp-claw-tts-stream.patch`；真机录音回放实测 `RESULT=OK`，首帧起播 5ms，见 §7.3） |
+| ③ | 解码/写盘下沉 C、去掉 FATFS 中转 | `cap_http_request` 新增 `decode_base64_field`，在 C 侧完成字段级流式 base64 解码并直接落音频文件 | ✅（补丁 `esp-claw-voice-latency.patch`） |
+| ④ | LLM 流式 SSE + 句子级流水线 | C 侧增量 delta → `/fatfs/voice_stream.txt`；`voice_ptt.lua` 常驻消费、按句切分逐句 TTS 播放 | ✅（补丁 `esp-claw-llm-stream.patch`） |
+| ⑤ | 连接/会话复用 | — | ⏳ 未开始 |
+| ⑥ | 降码率/采样率 | `tts_volcano.lua` 采样率 24kHz→16kHz（见 §6.3） | ✅（overlay，无补丁） |
+| ⑦ | 构建验证 + 固化补丁 + 文档 | 本文件 + `setup_esp_claw.sh` 注册三个新补丁 | ✅ |
+
+### 7.1 LLM 流式 + 句子级流水线（优化④，本轮实现）
+
+目标：不再等 LLM 完整回复，而是**边生成边播报**——首句一到就合成播放，后续句子在播放中陆续就绪。
+
+**C 侧（`esp-claw-llm-stream.patch`，8 个文件）**
+
+- `claw_llm_types.h` / `claw_llm_http_transport.c` / `claw_llm_backend_openai_compatible.c`：
+  为 OpenAI 兼容后端启用 `stream:true` 的 SSE，**在 transport 层增量解析** `data:` 行，
+  逐 delta 触发回调（`on_delta(text_delta, user_ctx)`），仅累积完整文本；非流式后端不受影响。
+- `claw_core_llm.[ch]`：把 `on_delta` / `on_delta_user_ctx` 透传给后端。
+- `claw_core.h`：新增 `CLAW_CORE_REQUEST_FLAG_STREAM_REPLY (1U << 4)`。
+- `claw_core_agent_loop.c`：当请求带该 flag 时，打开 `claw_core_stream_sink_t`，把每个 delta
+  写入 `/fatfs/voice_stream.txt`（**每累积约 12 字节 `fflush`+`fsync`**，让消费端尽快看到），
+  结束后追加结束标记 `\x01\x01END\x01\x01` 并关闭。**已流式发出的请求不再重复发 `out_message`**
+  （避免非流式回退路径又播一遍）。
+- `claw_event_router.c`：目标/来源 `chat_id == "voice"` 时，为该 agent 请求置 `STREAM_REPLY` flag。
+
+> 用**文件**（而非新增 Lua↔C 绑定或事件）做流桥，是为了复用既有机制、零新增绑定：C 侧天然串行，
+> 避免路由 async 并发拉起多路播放。
+
+**Lua 侧（overlay，`voice_ptt.lua` + 共享模块 `voice_tts.lua`）**
+
+- `voice_ptt.lua` 状态机新增 `waiting` 态：注入 ASR 文本进 Agent 后即进入等待，**每 20ms** 轮询
+  增量读取 `voice_stream.txt`，按标点（强标点 `。！？!?；;\n` / 弱标点 `，,、：:`，弱标点超 40 字兜底）
+  切句入队，逐句经 `voice_tts.synthesize()` 合成并用 `audio.player` 播放（player 惰性创建，
+  一句播完再播下一句）→ 天然串行、无需并发仲裁。
+- 结束条件：读到结束标记 **且** 队列清空 **且** player 空闲 → 写回「空闲」，回到 `idle` 态。
+- barge-in：`start_recording()` 与 `wait_step()` 轮询里检查 `/fatfs/voice_interrupt`，命中即
+  `player:stop()` 并中止等待（复用 §6 的打断标志）。
+- 超时：沿用 `REPLY_TIMEOUT_MS`（30s），无任何 delta 则状态行显示 `AI 无响应`。
+- `voice_reply.lua` 重构为复用共享模块 `voice_tts.lua`（generic 端点或 provider 分派），
+  作为**非流式回退路径**保留（LLM 后端不支持流式时仍可用）。
+
+### 7.2 接线与验证
+
+`setup_esp_claw.sh` 在语音延迟补丁之后新增**三段**幂等 `git apply`（先 `--check`，已应用则
+`--reverse --check` 跳过），依次注册 `esp-claw-voice-latency.patch`、`esp-claw-llm-stream.patch`
+与 `esp-claw-tts-stream.patch`；Lua/面板改动仍走 fatfs overlay 的 `cp -R`（见 §3）。
+
+构建验证：`cd esp-claw/application/edge_agent && idf.py build` → `edge_agent.bin`（0x425b60，约 4.15MB）
+链接成功、`system.bin` 重新打包成功。**真机录音回放实测通过**（2026-10-13，见 §7.3）。
+
+> 新增 `cap_tts_stream` 组件后**首次构建需先 `idf.py reconfigure`**：`idf.py build` 触发的
+> `cmake --regenerate-during-build` 不会重跑 IDF 组件管理器的清单求解，嵌套 `idf_component.yml`
+> 改动不生效；本补丁已把 `cap_tts_stream` 注册进根清单 `main/idf_component.yml`，故正确重配即解析。
+
+### 7.3 TTS 真·边收边播（优化②，本轮实现）
+
+目标：TTS 音频**边下载边播放**，不再「等服务端全量合成 → base64 全量落盘 → 解码 → 再播」，
+把 TTS 首帧等待压到最低。
+
+**C 侧（`esp-claw-tts-stream.patch`）**
+
+- 新增组件 `components/claw_capabilities/cap_tts_stream`（纯 C helper，非 claw 工具组，故**无需**
+  `app_capabilities.c`/Kconfig 注册）：起一个 HTTP 任务 `POST` 流式端点，**增量扫描**响应里的
+  `"data":"<base64>"` 字段，逐块 `mbedtls_base64_decode` 后推入 `StreamBuffer`（48KB，带背压），
+  供播放器**拉取**：`cap_tts_stream_begin/read/end/active`（`read` 返回 `>0` 字节数 / `0`=EOF / `<0`=错误）。
+- `lua_module_audio`：`esp_asp_cfg_t.in.cb` 增 `audio_player_in_cb` → `cap_tts_stream_read`；
+  新增 Lua 方法 **`player:play_stream({url, headers, body, timeout_ms})`**（`lua_audio_player_play_stream`），
+  走 `raw://tts/stream.mp3` URI（`AUDIO_STREAM_RAW_URI`）。`player:stop()`/`close()` 调 `cap_tts_stream_end()` 收尾（barge-in 复用）。
+  **现有 `player({output=...})` 文件播放路径完全不变**（全部为新增可选路径）。
+
+**Lua 侧（overlay，`tts_volcano.lua` + `voice_tts.lua` + `voice_ptt.lua`）**
+
+- `providers/tts_volcano.lua` 增 `stream_request(cfg, text)` → 返回 `{url, headers, body, timeout_ms}`（不落盘）；
+  `voice_tts.lua` 增 `stream_request` 分派：provider 为空/`generic` 返回 `nil`（回退落盘路径），否则转发 provider 的同名函数。
+- `voice_ptt.lua` 增 `play_sentence_stream(sentence)`：`stream_request` → 必要时创建 `audio.player` →
+  `player:play_stream(req)`；`play_sentence` 优先走流式，失败/不支持则回退 `synthesize` + `player:play(path)`。
+- **流式模式门控**：`cap_tts_stream` 为**单会话**，故流式下**必须等上一句播完再起下一句**
+  （`wait_step` 用 `player_running` gate）；非流式模式保持原有逐句串行行为不变。
+- **开关（默认关闭、零回归）**：在设备「文件」页把 `voice_tts_stream` 标记文件加到 `/fatfs` 即启用
+  边收边播；删除即回退「落盘合成」路径。与仓库既有 `wake_trigger`/`voice_interrupt` 同款标记文件模式，
+  **不引入 web UI / C 配置改动**。
+
+> ⚠️ **已知行为差异**：item ② 直连 `esp_http_client`（在 `cap_tts_stream` 内），**绕过**
+> `cap_http_request` 的主机白名单校验；即只要网页配置页填了 TTS 端点，流式路径即会直连该主机。
+> 未开启该标记文件时不受影响（仍走 `cap_http_request` 受白名单约束）。
+> ⚠️ **真机回放实测（2026-10-13，ESP32-P4 rev1.3，保留 storage 分区仅烧 app+system）**：
+> 用罐装录音 `/system/voicetest/asr_sample.wav`（16kHz/mono/16bit，「今天天气怎么样」）驱动
+> 全链路自测脚本 `voice_e2e.lua`，串口 REPL 执行 `lua --run --path /system/voicetest/voice_e2e.lua`：
+> `ASR=OK text=今天天气怎么样？` → `reply streamed; skipping out_message publish`（流式路径）
+> → `tts_stream: session done: pushed=82413 bytes, status=200` →
+> `PLAY[1] start=5.0ms done=16498.0ms` → `RESULT=OK sentences=1 first_play=7984.0ms total=24522ms`。
+> **首帧起播仅 5ms**（提交流式请求到播放器进入 running），证实「边收边播」而非等全量落盘；全程无 panic/看门狗。
+> barge-in 打断在途音频仍待专项实测。
+
+### 7.4 语音回复上屏修复 + 屏幕桥收敛为共享模块（本轮实现）
+
+**症状**：语音问答后状态行/「你说」正常，但面板「AI 说」永远不更新。
+
+**根因**：`voice` 渠道的每轮对话 C 侧恒定走流式（`claw_event_router.c` 对 `chat_id=="voice"`
+必打 `STREAM_REPLY`），流式下 `claw_core_agent_loop.c` 在 `stream_sink.emitted` 时**跳过
+`out_message` 发布**，于是路由规则 `voice_reply_run_script`（匹配 `out_message`）永不命中，
+`voice_reply.lua` 成为死路径——而它恰是 `voice_agent.txt` 的**唯一写入者**，故「AI 说」永不刷新。
+
+**修复（candidates 1+2）**
+
+- 新增共享模块 `system/skills/voice/scripts/voice_common.lua`，作为三个 `/fatfs` 约定的
+  **唯一 owner**：屏幕桥（`set_status`/`set_user`/`set_agent`/`append_agent`/`clear_agent`/
+  `read_status`）、运行时配置桥（`load_runtime_config`/`runtime_config`）、打断信道
+  （`signal_interrupt`/`clear_interrupt`/`interrupt_requested`）。此前这三件事在
+  `voice_ptt.lua` / `voice_reply.lua` 里各有一份逐字相同的拷贝，加字段要改多处且易走偏。
+- `voice_ptt.lua` 的流式播报路径在**每切出一句**时 `vc.append_agent(sentence)`（面板随播报
+  逐句增长），并在 `arm_reply_wait()`（注入前）`vc.clear_agent()` 清空上一轮，避免增量接力粘连。
+- 屏幕桥写盘改为**非破坏性原子写**：写 `<name>.tmp` → 删目标 → 改名（FatFs `f_rename` 在目标
+  已存在时返回 `FR_EXIST`，故必须先删）；若面板恰落在窗口期，读到文件不存在会**跳过本次刷新**
+  保留上一帧，不闪空白。
+- `voice_reply.lua` 与非流式回退路径保留（构成真 seam），改为调用同一模块；`voice_e2e.lua`
+  新增上屏断言 `SCREEN=OK|MISMATCH|EMPTY`。
+
+**真机实测（2026-10-13，ESP32-P4 rev1.3，仅烧 app+system，保留 storage）**
+
+```
+[voice_e2e] ASR=OK text=今天天气怎么样？
+I (18512) ha_panel: voice agent:
+[voice_e2e] SENTENCE[1] text=深圳天气这边我真拿不到，…
+I (27397) ha_panel: voice agent: 深圳天气这边我真拿不到，…
+[voice_e2e] SCREEN=OK chars=144
+```
+
+`SCREEN=OK` 表示 `voice_agent.txt` 内容与流式可见文本逐字相符；`ha_panel: voice agent: …`
+为面板轮询到新文本并刷新 LVGL 标签的直接证据。该修复不依赖 C 侧改动。
+
+> ⚠️ **同轮观察到的独立问题（不在本轮范围）**：本次自测 `PLAY[1]` 报
+> `E tts_stream: stream buffer create failed` → `RESULT=PARTIAL`。该失败发生在 C 侧
+> `cap_tts_stream` 的 `xStreamBufferCreate(48KB)`（内部 RAM），与本次 Lua 收敛无关（未改播放
+> 路径）；疑似常驻 WakeNet/AFE + WiFi 占用内部 RAM 后 48KB 连续块拿不到，与 §7.3 早期
+> `RESULT=OK` 的差异待专项排查。**播放失败不影响本轮「回复上屏」的验证结论。**
+
+### 7.5 状态码桥 + 可滚动多轮会话记录（候选 3+4，本轮实现）
+
+**候选 3 — 状态 token 枚举（消除中文字面量耦合）**
+
+- 动因：`voice_status.txt` 原为自由中文串（`录音中`/`识别中`/…），面板靠 `strcmp` 比对中文
+  字面量决定「忙碌」指示灯。措辞与语义耦合——改一个字面量就悄悄改坏指示灯；失败原因又是另一
+  套自由文本，面板无法区分「流程态」与「失败态」。
+- 方案：`voice_status.txt` 改为单行 `<code>|<detail>`。`code` ∈
+  `idle` / `recording` / `recognizing` / `thinking` / `synthesizing` / `speaking` / `error`
+  （机器可读 token），`detail` 为可选自由文本（失败原因 / 火山短消息）。C 侧 `ha_panel.c` 用
+  `s_voice_status_map[]` 查表得中文标签 + `busy` 标志；未知 `code` 兜底为「未知」+ 忙碌。**一切
+  失败统一写 `error|<原因>`**。
+- Lua 侧：`voice_common.set_status(code, detail)` + `read_status_code()`；`voice_ptt.lua` 状态机
+  （`set_wait` / `set_error` / `tick_status`）改用 code，`tick_status` 到期改写前用
+  `read_status_code()` 做 guard，避免覆盖 `voice_reply.lua` 已推进的新状态。
+
+**候选 4 — 可滚动多轮会话记录（取代单条「你说/AI 说」）**
+
+- 动因：原单条「你说 / AI 说」只能看到最后一轮；回复上限 768B 且两段缓冲开在 8KB 任务栈上。
+- 方案：新增 `voice_log.txt`，内容为多条记录 `<role>\x1f<text>\x1e>`（`role` = `U`/`A`；
+  `\x1f`/`\x1e` 控制符分隔，LLM 输出不含故无需转义），**取代** `voice_user.txt` /
+  `voice_agent.txt`。`voice_common` 侧 `log_user` / `log_agent` / `log_agent_append` /
+  `clear_log`，按 `MAX_LOG_RECORDS` (8) 裁剪。
+  - **流式逐句增长同一气泡**：`log_agent_append` 命中最后一条 A 则拼接，否则新建；每轮先
+    `log_user` 写 U，使新回复的 append 不会粘到上一轮的 A。
+  - **流式 ASR 增量**：`log_user` 覆盖最后一条 U（而非新增），支持识别文本逐段上屏。
+- C 侧：`ha_panel.c` 语音页 = 固定状态行 + 可滚动 log 容器（flex column +
+  `lv_obj_set_scroll_dir(LV_DIR_VER)` + `LV_SCROLLBAR_MODE_AUTO`）；`ha_panel_read_raw` 二进制
+  安全读入 **PSRAM** 缓冲（40KB read + 40KB snapshot），`strcmp` 与快照比对、仅变更时
+  `ha_panel_rebuild_log()` 重建气泡并 `lv_obj_scroll_to_view` 到最后一条。单条上限
+  `HA_VOICE_TEXT_MAX` 768 → 4096，缓冲移出任务栈/内部 RAM。
+
+**真机实测（2026-10-13，ESP32-P4 rev1.3，仅烧 app+system，保留 storage）**
+
+```
+[voice_e2e] ASR=OK text=今天天气怎么样？
+I (18668) ha_panel: voice log rebuilt: 1 record(s)
+I (19110) ha_panel: voice status: code=recognizing detail=e2e-probe
+[voice_e2e] SENTENCE[1] text=答案还是一样：深圳天气查不到，我不会编。你想测什么直接说。
+I (23749) ha_panel: voice log rebuilt: 2 record(s)
+I (25633) tts_stream: session done: pushed=45549 bytes, status=200
+[voice_e2e] RESULT=OK sentences=1 first_play=4942.0ms total=16689ms
+[voice_e2e] SCREEN=OK chars=87
+[voice_e2e] STATUS=OK value=recognizing|e2e-probe
+I (36030) ha_panel: voice status: code=idle detail=-
+```
+
+- `voice log rebuilt: 1 record(s)` → `2 record(s)`：面板按控制符切分并重建气泡（先用户气泡，再追加
+  助手气泡），候选 4 的 C 重建路径被真实执行。
+- `voice status: code=recognizing detail=e2e-probe`：C 侧查表 + `detail` 解析成功（`e2e-probe`
+  为自测探针写入的 detail）；末尾 `code=idle` 为收尾 `set_status("idle")` 被面板映射，候选 3
+  端到端贯通。
+- `SCREEN=OK` / `STATUS=OK`：`voice_log.txt` / `voice_status.txt` 的字节与脚本写入逐字相符。
+- 另在真实 PTT 流程中观察到 `[voice_ptt] status -> error (ASR 网络连接失败)` →
+  `ha_panel: voice status: code=error detail=ASR 网络连接失败`，验证失败态 `code|detail` 端到端。
+- 同轮 `tts_stream: session done: pushed=45549 bytes, status=200` → §7.4 记录的
+  `stream buffer create failed` 本轮未复现（播放正常，`PLAY[1] done=11712ms`）。

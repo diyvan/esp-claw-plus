@@ -25,6 +25,9 @@ ASR 转文本后注入 Agent, Agent 的回复再经 TTS 播放。
 - `scripts/voice_reply.lua` — 回复播报。由路由规则调用, 回复文本在 `args.text`。
   真实 TTS: 把文本 POST 给云 TTS, 响应音频落盘后异步播放; 播放期间轮询打断标志
   `/fatfs/voice_interrupt`, 命中即停止 (语音打断 / barge-in)。
+- `scripts/voice_common.lua` — 共享模块, 是三个 `/fatfs` 约定的**唯一 owner**: 屏幕桥
+  (对话文本上屏)、运行时配置桥、语音打断信道。`voice_ptt.lua` / `voice_reply.lua` /
+  `voice_e2e.lua` 都 `require("voice_common")` (与调用方同目录, `package.path` 首位即命中)。
 - `scripts/voice_selftest.lua` — 录音+回放自检 (不依赖 BOOT 键), 用于验证麦克风/扬声器
   通路: `lua --run --path /system/skills/voice/scripts/voice_selftest.lua`。
 - `scripts/providers/` — 云端服务适配层 (供应商插件)。`util.lua` 提供 base64 编解码 /
@@ -105,8 +108,9 @@ ASR 适配器若导出 `open` 则走**流式会话** (边说边发、增量上�
 ## 语音打断 (barge-in)
 
 跨脚本唯一可行的信道是 `/fatfs` 文件 (音频无全局仲裁器): 用户按下 BOOT 或唤醒命中时,
-`voice_ptt.lua` 写 `/fatfs/voice_interrupt` 空标志; `voice_reply.lua` 播放中每 20ms 轮询,
-见到标志即 `player:stop()` 并清标志, 实现"说话即打断 TTS"。
+`voice_ptt.lua` 经 `voice_common.signal_interrupt()` 写 `/fatfs/voice_interrupt` 空标志;
+`voice_reply.lua` 播放中每 20ms 经 `voice_common.interrupt_requested()` 轮询, 见到标志即
+`player:stop()` 并清标志, 实现"说话即打断 TTS"。标志文件的读写统一由 `voice_common` 承载。
 
 ## 相关技能
 
@@ -116,8 +120,9 @@ ASR 适配器若导出 `open` 则走**流式会话** (边说边发、增量上�
 ## 运行时配置桥 (网页 -> 语音脚本)
 
 网页「语音助手」页保存的配置, 由 C 侧 `ha_panel.c` 的
-`ha_panel_publish_runtime_config()` 写入 `/fatfs/ha_voice_runtime.json`; 两个脚本读取该
-JSON 获取 ASR/TTS 端点与唤醒开关 (与屏幕桥同向, 复用 `/fatfs` 可写分区, 无需新增
+`ha_panel_publish_runtime_config()` 写入 `/fatfs/ha_voice_runtime.json`; 两个脚本经
+`voice_common.load_runtime_config()` (每次真读) / `voice_common.runtime_config()` (1s 缓存)
+读取该 JSON 获取 ASR/TTS 端点与唤醒开关 (与屏幕桥同向, 复用 `/fatfs` 可写分区, 无需新增
 Lua<->C 绑定)。字段:
 
 | 字段 | 用途 |
@@ -134,33 +139,83 @@ Lua<->C 绑定)。字段:
 
 配置在网页保存后即时生效, 无需重启 (脚本每 1s 重新读取一次)。
 
-## 屏幕桥 (对话文本上屏)
+## 屏幕桥 (状态码 + 对话上屏)
 
-语音对话内容会同步显示到 M1 的 LVGL 面板 (`ha_panel.c`)。桥接方式为文件: 脚本通过
-`storage.write_file` 写 `/fatfs/voice_*.txt`, 面板每 200ms 轮询读取并刷新标签。
+语音状态与多轮对话会同步显示到 M1 的 LVGL 面板 (`ha_panel.c`)。桥接方式为文件: 脚本经共享
+模块 `voice_common` (`/system/skills/voice/scripts/voice_common.lua`) 写 `/fatfs/voice_*.txt`,
+面板每 200ms 轮询读取并刷新。`voice_common` 是这些文件的**唯一 owner**——新增任何写入方只需
+`require("voice_common")`, 不要再在脚本里自带一份写盘拷贝。
+
+写入接口:
+
+| 接口 | 作用 |
+| --- | --- |
+| `set_status(code, detail)` | 写状态码 `code` + 可选自由文本 `detail` (失败原因等) |
+| `read_status_code()` | 读回当前状态码 (状态机到期 guard 用) |
+| `log_user(text)` | 写入/覆盖最后一条用户气泡 (流式 ASR 增量刷新同一气泡) |
+| `log_agent(text)` | 追加一条助手气泡 (非流式整段回复) |
+| `log_agent_append(delta)` | 追加到最后一个助手气泡 (流式逐句增长; 末条非 A 则新建) |
+| `clear_log()` | 清空会话记录 (仅自测脚本用; 正常运行靠裁剪, 不清历史) |
+
+### `voice_status.txt` — 状态码桥
+
+内容为单行 `<code>|<detail>`。`code` 是**机器可读 token**, 由面板查表映射成中文标签 + 忙碌
+标志; `detail` 是可选的自由文本 (失败原因 / 火山短消息)。**code 与措辞分离**: 面板改中文标签
+不会悄悄破坏忙碌指示灯; 面板对未知 `code` 兜底为「未知」并视为忙碌。
+
+| code | 面板标签 | 忙碌 |
+| --- | --- | --- |
+| `idle` | 空闲 | 否 |
+| `recording` | 录音中 | 是 |
+| `recognizing` | 识别中 | 是 |
+| `thinking` | 思考中 | 是 |
+| `synthesizing` | 合成中 | 是 |
+| `speaking` | 播报中 | 是 |
+| `error` | 出错 | 是 |
+
+正常流程态 (非 `idle`/`error`) 可带 `detail`; 一切失败统一写 `error|<原因>`, 面板显示
+「状态: 出错 · <原因>」。
+
+### `voice_log.txt` — 会话记录桥
+
+内容为多条记录, 每条为 `<role>\x1f<text>\x1e`:
+
+- `role` = `U` (用户) / `A` (助手);
+- `\x1f` (US, 十进制 31) 分隔 role 与 text; `\x1e` (RS, 十进制 30) 分隔记录;
+- LLM 输出不会包含这两个控制符, 故**无需转义**。
+
+`voice_common` 侧按 `MAX_LOG_RECORDS` (8) 裁剪, 只保留最近 8 条; 面板按控制符切分渲染最近
+8 条 (与 Lua 裁剪数对齐), 以 `你说:` / `AI 说:` 两种颜色气泡逐条显示, 并自动滚到最后一条。
+C 侧读缓冲与快照各 40KB, 分配在 **PSRAM** (内部 RAM 紧张且渲染不需要 DMA)。
+
+写盘为**非破坏性原子写**: 先写 `<name>.tmp` 再删目标改名 (FatFs `f_rename` 在目标已存在时
+返回 `FR_EXIST`, 故必须先删); 若面板恰好落在"目标已删、改名前"的窗口里, 读到的是文件不存在,
+`ha_panel_read_text` / `ha_panel_read_raw` 返回 false 会**跳过本次刷新**, 保留上一帧——因此不会
+闪空白, 也不会清空已显示的气泡。
 
 | 文件 | 写入方 | 内容 |
 | --- | --- | --- |
-| `/fatfs/voice_status.txt` | `voice_ptt.lua` / `voice_reply.lua` | 状态: 流程态 `录音中` / `识别中` / `思考中` / `合成中` / `播报中` / `空闲`; 失败态见下 |
-| `/fatfs/voice_user.txt` | `voice_ptt.lua` | ASR 转出的用户文本 |
-| `/fatfs/voice_agent.txt` | `voice_reply.lua` | Agent 回复文本 |
+| `/fatfs/voice_status.txt` | `voice_common` (`voice_ptt.lua` / `voice_reply.lua` 调用) | 单行 `<code>|<detail>` (见上表) |
+| `/fatfs/voice_log.txt` | `voice_common` (`voice_ptt.lua` 流式逐句 `log_agent_append` + `log_user`; `voice_reply.lua` 整段 `log_agent`) | 最近 8 条 `<role>\x1f<text>\x1e` 对话记录 |
 
-**状态反馈**: 每个阶段都把状态/失败原因写进 `voice_status.txt` (面板「状态:」行, 非「空闲」时点亮
-指示灯) 并同步打串口日志, **不再静默回到「空闲」**。各阶段的反馈词:
+**状态反馈**: 每个阶段都把状态码写进 `voice_status.txt` (面板「状态:」行, 非 `idle` 时点亮
+指示灯) 并同步打串口日志, **不再静默回到「空闲」**。流程态写对应 `code` (`recording` /
+`recognizing` / `thinking` / `synthesizing` / `speaking`); 一切失败统一写 `error|<原因>`,
+面板显示「状态: 出错 · <原因>」。各阶段的失败原因:
 
-| 阶段 | 反馈 |
+| 阶段 | 失败原因 (`error` 的 detail) |
 | --- | --- |
 | 开录音 | `麦克风不可用` / `麦克风占用` (设备或仲裁器拿不到) |
-| 录音中 | `录音中`; 读不到数据 → `麦克风读取失败` |
+| 录音中 | `麦克风读取失败` (读不到数据) |
 | 录音收尾 | `录音太短 Nms` (松手太快, < 500ms); `未录到声音` (整段峰值 RMS < 150, 不再上传); `录音写盘失败` |
-| ASR | `识别中` → `未配置 ASR` / `未配置 ASR 密钥` / `ASR 网络错误` / `ASR HTTP 4xx` / `未识别到语音` (火山返回短消息时直接透出) |
-| Agent | `思考中` → 30s 内无回复 → `AI 无响应` |
-| TTS | `合成中` → `TTS 网络错误` / `TTS HTTP 4xx` / `TTS 无音频返回` / `未配置 TTS` |
-| 播放 | `播报中` → `播放失败` / `播放器创建失败` / `扬声器占用`; 正常播完回 `空闲` |
+| ASR | `未配置 ASR` / `未配置 ASR 密钥` / `ASR 网络错误` / `ASR HTTP 4xx` / `未识别到语音` (火山返回短消息时直接透出) |
+| Agent | 30s 内无回复 → `AI 无响应` |
+| TTS | `TTS 网络错误` / `TTS HTTP 4xx` / `TTS 无音频返回` / `未配置 TTS` |
+| 播放 | `播放失败` / `播放器创建失败` / `扬声器占用`; 正常播完回 `idle` |
 
-失败态保留时长: `voice_ptt.lua` 内的失败态保留 4s 后自动回「空闲」(到期改写前会校验面板内容,
+失败态保留时长: `voice_ptt.lua` 内的失败态保留 4s 后自动回 `idle` (到期改写前会校验面板内容,
 避免覆盖 `voice_reply.lua` 已推进的新状态); `voice_reply.lua` 是一次性脚本, 其失败态保留到下一次
-语音交互 (PTT 写「录音中」) 覆盖。
+语音交互 (PTT 写 `recording`) 覆盖。
 
 注意: `/system` 为只读 FAT, 运行时写入必须落在可读写的 `/fatfs` (storage 分区)。
 

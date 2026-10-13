@@ -1,0 +1,447 @@
+diff --git a/components/claw_capabilities/cap_http_request/CMakeLists.txt b/components/claw_capabilities/cap_http_request/CMakeLists.txt
+index 80e3c8b..d8feb79 100644
+--- a/components/claw_capabilities/cap_http_request/CMakeLists.txt
++++ b/components/claw_capabilities/cap_http_request/CMakeLists.txt
+@@ -7,4 +7,5 @@ idf_component_register(
+         claw_cap
+         esp_http_client
+         http_reuse
++        mbedtls
+ )
+diff --git a/components/claw_capabilities/cap_http_request/src/cap_http_request.c b/components/claw_capabilities/cap_http_request/src/cap_http_request.c
+index 5b9e3d7..969df55 100644
+--- a/components/claw_capabilities/cap_http_request/src/cap_http_request.c
++++ b/components/claw_capabilities/cap_http_request/src/cap_http_request.c
+@@ -5,6 +5,7 @@
+  */
+ #include "cap_http_request.h"
+ 
++#include <ctype.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -17,6 +18,7 @@
+ #include "esp_crt_bundle.h"
+ #include "esp_http_client.h"
+ #include "esp_log.h"
++#include "mbedtls/base64.h"
+ 
+ static const char *TAG = "cap_http_request";
+ 
+@@ -26,6 +28,7 @@ static const char *TAG = "cap_http_request";
+ #define CAP_HTTP_REQUEST_MAX_FILE_LIMIT     2147483647
+ #define CAP_HTTP_REQUEST_ALLOWLIST_MAX      320
+ #define CAP_HTTP_REQUEST_REDIRECT_URL_MAX   512
++#define CAP_HTTP_REQUEST_DECODE_FIELD_MAX   64
+ 
+ typedef struct {
+     char *data;
+@@ -39,6 +42,17 @@ typedef struct {
+     bool truncated;
+     bool check_redirect_allowlist;
+     char redirect_location[CAP_HTTP_REQUEST_REDIRECT_URL_MAX];
++    /* decode_base64_field 模式: 把响应体当作 JSON 对象序列, 增量提取指定字段的
++     * base64 值, 逐块解码后直写 file —— 避免中间落盘与上层 (Lua) 解码。 */
++    char decode_pattern[CAP_HTTP_REQUEST_DECODE_FIELD_MAX + 3]; /* '"' + field + '"' + '\0' */
++    size_t decode_pattern_len;
++    char *pending;
++    size_t pending_len;
++    size_t pending_cap;
++    bool in_value;
++    size_t decode_chunk_errors;
++    uint8_t *decode_scratch;
++    size_t decode_scratch_cap;
+ } cap_http_request_buf_t;
+ 
+ typedef struct {
+@@ -50,6 +64,177 @@ static EXT_RAM_BSS_ATTR cap_http_request_state_t s_http_request = {0};
+ static bool cap_http_request_extract_url_host(const char *url, char *host, size_t host_size);
+ static bool cap_http_request_host_allowed(const char *host);
+ 
++static char *cap_http_request_find_bytes(const char *hay, size_t hay_len,
++                                         const char *needle, size_t needle_len)
++{
++    size_t i;
++
++    if (!needle_len || hay_len < needle_len) {
++        return NULL;
++    }
++    for (i = 0; i + needle_len <= hay_len; i++) {
++        if (hay[i] == needle[0] && memcmp(hay + i, needle, needle_len) == 0) {
++            return (char *)hay + i;
++        }
++    }
++    return NULL;
++}
++
++static char *cap_http_request_find_char(const char *hay, size_t hay_len, char c)
++{
++    size_t i;
++
++    for (i = 0; i < hay_len; i++) {
++        if (hay[i] == c) {
++            return (char *)hay + i;
++        }
++    }
++    return NULL;
++}
++
++static esp_err_t cap_http_request_pending_append(cap_http_request_buf_t *buf,
++                                                 const char *data, size_t len)
++{
++    char *grown = NULL;
++    size_t new_cap;
++
++    if (buf->pending_len + len + 1 > buf->pending_cap) {
++        new_cap = buf->pending_cap ? buf->pending_cap * 2 : 8192;
++        if (new_cap < buf->pending_len + len + 1) {
++            new_cap = buf->pending_len + len + 1;
++        }
++        grown = realloc(buf->pending, new_cap);
++        if (!grown) {
++            return ESP_ERR_NO_MEM;
++        }
++        buf->pending = grown;
++        buf->pending_cap = new_cap;
++    }
++    memcpy(buf->pending + buf->pending_len, data, len);
++    buf->pending_len += len;
++    buf->pending[buf->pending_len] = '\0';
++    return ESP_OK;
++}
++
++/* 解码一个 base64 分块并追加写入 buf->file。坏块只记警告并跳过, 尽量保留可用音频。 */
++static esp_err_t cap_http_request_decode_chunk(cap_http_request_buf_t *buf,
++                                               const char *b64, size_t b64_len)
++{
++    size_t out_len = 0;
++    size_t need;
++
++    if (b64_len == 0) {
++        return ESP_OK;
++    }
++
++    need = ((b64_len + 3) / 4) * 3 + 4;
++    if (need > buf->decode_scratch_cap) {
++        uint8_t *grown = realloc(buf->decode_scratch, need);
++
++        if (!grown) {
++            return ESP_ERR_NO_MEM;
++        }
++        buf->decode_scratch = grown;
++        buf->decode_scratch_cap = need;
++    }
++
++    if (mbedtls_base64_decode(buf->decode_scratch, buf->decode_scratch_cap, &out_len,
++                              (const unsigned char *)b64, b64_len) != 0) {
++        buf->decode_chunk_errors++;
++        ESP_LOGW(TAG, "base64 decode failed for a %zu-byte chunk", b64_len);
++        return ESP_OK;
++    }
++    if (out_len == 0) {
++        return ESP_OK;
++    }
++    if (buf->max_file_bytes > 0 && buf->file_bytes + out_len > buf->max_file_bytes) {
++        out_len = buf->max_file_bytes - buf->file_bytes;
++        buf->truncated = true;
++    }
++    if (out_len > 0 && fwrite(buf->decode_scratch, 1, out_len, buf->file) != out_len) {
++        buf->file_write_failed = true;
++        return ESP_FAIL;
++    }
++    buf->file_bytes += out_len;
++    return ESP_OK;
++}
++
++/* 从 pending 缓冲里增量扫描 '"field"' + ':' + '"' + <base64> + '"' 并逐块解码。
++ * 未闭合的片段保留到下一批数据, 因此可跨 HTTP chunk 边界。 */
++static esp_err_t cap_http_request_decode_process(cap_http_request_buf_t *buf)
++{
++    size_t pos = 0;
++
++    for (;;) {
++        size_t avail = buf->pending_len - pos;
++
++        if (!buf->in_value) {
++            char *hit = cap_http_request_find_bytes(buf->pending + pos, avail,
++                                                    buf->decode_pattern, buf->decode_pattern_len);
++            size_t k;
++            size_t j;
++
++            if (!hit) {
++                /* 保留可能是被截断的模式前缀 (如结尾的 '"dat') */
++                size_t keep = buf->decode_pattern_len - 1;
++
++                pos = (avail > keep) ? (buf->pending_len - keep) : pos;
++                break;
++            }
++            k = (size_t)(hit - buf->pending);
++            j = k + buf->decode_pattern_len;
++            while (j < buf->pending_len && isspace((unsigned char)buf->pending[j])) {
++                j++;
++            }
++            if (j >= buf->pending_len) {
++                pos = k;
++                break;
++            }
++            if (buf->pending[j] != ':') {
++                pos = k + 1;
++                continue;
++            }
++            j++;
++            while (j < buf->pending_len && isspace((unsigned char)buf->pending[j])) {
++                j++;
++            }
++            if (j >= buf->pending_len) {
++                pos = k;
++                break;
++            }
++            if (buf->pending[j] != '"') {
++                /* 如 "data":null —— 此处没有 base64 值, 从该位置继续扫描 */
++                pos = j;
++                continue;
++            }
++            buf->in_value = true;
++            pos = j + 1;
++        } else {
++            char *end = cap_http_request_find_char(buf->pending + pos,
++                                                   buf->pending_len - pos, '"');
++            size_t q;
++            esp_err_t err;
++
++            if (!end) {
++                break;
++            }
++            q = (size_t)(end - buf->pending);
++            err = cap_http_request_decode_chunk(buf, buf->pending + pos, q - pos);
++            if (err != ESP_OK) {
++                return err;
++            }
++            buf->in_value = false;
++            pos = q + 1;
++        }
++    }
++
++    if (pos > 0) {
++        memmove(buf->pending, buf->pending + pos, buf->pending_len - pos);
++        buf->pending_len -= pos;
++    }
++    return ESP_OK;
++}
++
+ static esp_err_t cap_http_request_event_handler(esp_http_client_event_t *event)
+ {
+     cap_http_request_buf_t *buf = NULL;
+@@ -92,6 +277,13 @@ static esp_err_t cap_http_request_event_handler(esp_http_client_event_t *event)
+         }
+         append_len = (size_t)event->data_len;
+ 
++        if (buf->decode_pattern_len > 0) {
++            if (cap_http_request_pending_append(buf, (const char *)event->data, append_len) != ESP_OK) {
++                return ESP_ERR_NO_MEM;
++            }
++            return cap_http_request_decode_process(buf);
++        }
++
+         if (buf->file) {
+             size_t write_len = append_len;
+ 
+@@ -357,6 +549,7 @@ static esp_err_t cap_http_request_execute(const char *input_json,
+     cJSON *max_body_item = NULL;
+     cJSON *save_path_item = NULL;
+     cJSON *max_file_item = NULL;
++    cJSON *decode_field_item = NULL;
+     cap_http_request_buf_t buf = {0};
+     esp_http_client_config_t config = {0};
+     esp_http_client_handle_t client = NULL;
+@@ -397,6 +590,7 @@ static esp_err_t cap_http_request_execute(const char *input_json,
+     max_body_item = cJSON_GetObjectItem(input, "max_body_bytes");
+     save_path_item = cJSON_GetObjectItem(input, "save_path");
+     max_file_item = cJSON_GetObjectItem(input, "max_file_bytes");
++    decode_field_item = cJSON_GetObjectItem(input, "decode_base64_field");
+ 
+     if (!cJSON_IsString(url_item) || !url_item->valuestring || !url_item->valuestring[0]) {
+         cJSON_Delete(input);
+@@ -486,6 +680,31 @@ static esp_err_t cap_http_request_execute(const char *input_json,
+         }
+         max_file_bytes = max_file_item->valueint;
+     }
++    if (decode_field_item) {
++        if (!cJSON_IsString(decode_field_item) ||
++                !decode_field_item->valuestring ||
++                !decode_field_item->valuestring[0] ||
++                strlen(decode_field_item->valuestring) > CAP_HTTP_REQUEST_DECODE_FIELD_MAX) {
++            cJSON_Delete(input);
++            free(tmp_save_path);
++            free(save_path_copy);
++            snprintf(output,
++                     output_size,
++                     "Error: decode_base64_field must be a non-empty string of at most %d chars",
++                     CAP_HTTP_REQUEST_DECODE_FIELD_MAX);
++            return ESP_ERR_INVALID_ARG;
++        }
++        if (!save_path) {
++            cJSON_Delete(input);
++            free(tmp_save_path);
++            free(save_path_copy);
++            snprintf(output, output_size, "Error: decode_base64_field requires save_path");
++            return ESP_ERR_INVALID_ARG;
++        }
++        snprintf(buf.decode_pattern, sizeof(buf.decode_pattern), "\"%s\"",
++                 decode_field_item->valuestring);
++        buf.decode_pattern_len = strlen(buf.decode_pattern);
++    }
+     if (body_item && !cJSON_IsString(body_item)) {
+         cJSON_Delete(input);
+         free(tmp_save_path);
+@@ -591,6 +810,10 @@ static esp_err_t cap_http_request_execute(const char *input_json,
+         err = ESP_FAIL;
+     }
+     buf.file = NULL;
++    free(buf.pending);
++    buf.pending = NULL;
++    free(buf.decode_scratch);
++    buf.decode_scratch = NULL;
+ 
+     if (err != ESP_OK) {
+         if (tmp_save_path) {
+@@ -607,6 +830,20 @@ static esp_err_t cap_http_request_execute(const char *input_json,
+         return err;
+     }
+ 
++    if (save_path_copy && buf.decode_pattern_len > 0 && buf.file_bytes == 0) {
++        remove(tmp_save_path);
++        free(buf.data);
++        free(tmp_save_path);
++        free(save_path_copy);
++        snprintf(output,
++                 output_size,
++                 buf.decode_chunk_errors > 0
++                     ? "Error: failed to decode base64 field '%s'"
++                     : "Error: no base64 field '%s' found in response",
++                 buf.decode_pattern);
++        return ESP_FAIL;
++    }
++
+     if (save_path_copy) {
+         if (rename(tmp_save_path, save_path_copy) != 0) {
+             remove(save_path_copy);
+@@ -619,13 +856,24 @@ static esp_err_t cap_http_request_execute(const char *input_json,
+                 return ESP_FAIL;
+             }
+         }
+-        snprintf(output,
+-                 output_size,
+-                 "HTTP %d%s\nSaved response body to %s (%zu bytes)",
+-                 status,
+-                 buf.truncated ? " (file truncated)" : "",
+-                 save_path_copy,
+-                 buf.file_bytes);
++        if (buf.decode_pattern_len > 0) {
++            snprintf(output,
++                     output_size,
++                     "HTTP %d%s\nDecoded base64 field '%s' to %s (%zu bytes)",
++                     status,
++                     buf.truncated ? " (file truncated)" : "",
++                     buf.decode_pattern,
++                     save_path_copy,
++                     buf.file_bytes);
++        } else {
++            snprintf(output,
++                     output_size,
++                     "HTTP %d%s\nSaved response body to %s (%zu bytes)",
++                     status,
++                     buf.truncated ? " (file truncated)" : "",
++                     save_path_copy,
++                     buf.file_bytes);
++        }
+     } else {
+         snprintf(output,
+                  output_size,
+@@ -654,6 +902,7 @@ static const claw_cap_descriptor_t s_http_request_descriptors[] = {
+         "\"headers\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}},"
+         "\"body\":{\"type\":\"string\"},"
+         "\"save_path\":{\"type\":\"string\"},"
++        "\"decode_base64_field\":{\"type\":\"string\"},"
+         "\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":120000},"
+         "\"max_body_bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":65535},"
+         "\"max_file_bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":2147483647}},"
+diff --git a/components/claw_modules/claw_core/src/claw_core_context.c b/components/claw_modules/claw_core/src/claw_core_context.c
+index 78d9415..f92c288 100644
+--- a/components/claw_modules/claw_core/src/claw_core_context.c
++++ b/components/claw_modules/claw_core/src/claw_core_context.c
+@@ -127,25 +127,47 @@ static esp_err_t append_tool_array_json(cJSON *tools, const char *json_text)
+     return ESP_OK;
+ }
+ 
++/* voice 渠道: 浏览器/IM 渠道回复会被 TTS 朗读并播放, 过度冗长会显著拉长首字延迟,
++ * 故对 chat_id = "voice" 的请求追加「简短口语化」约束 (见 docs/voice-integration.md)。 */
++#define CLAW_CORE_VOICE_CHAT_ID "voice"
++#define CLAW_CORE_VOICE_REPLY_MAX_CHARS 80
++
+ static char *build_current_turn_prompt(const claw_core_request_t *request)
+ {
+ #define CLAW_CORE_TURN_PROMPT_FMT \
+     "## Current Turn Context\n" \
+     "- source_channel: %s\n" \
+     "- source_chat_id: %s\n"
++#define CLAW_CORE_TURN_PROMPT_VOICE_FMT \
++    "## Current Turn Context\n" \
++    "- source_channel: %s\n" \
++    "- source_chat_id: %s\n" \
++    "- reply_mode: voice (the reply is synthesized to speech and played on a small screenless device)\n" \
++    "Keep the reply very short: at most 2 sentences and no more than %d characters. " \
++    "Use plain spoken language only - no markdown, lists, emoji, code, or URLs.\n"
+ #define CLAW_CORE_TURN_PROMPT_ARGS(req) \
+     (req)->source_channel ? (req)->source_channel : "(unknown)", \
+     (req)->source_chat_id ? (req)->source_chat_id : "(unknown)"
+ 
+     int needed;
+     char *text = NULL;
++    bool is_voice;
+ 
+     if (!request) {
+         text = NULL;
+         goto cleanup;
+     }
+ 
+-    needed = snprintf(NULL, 0, CLAW_CORE_TURN_PROMPT_FMT, CLAW_CORE_TURN_PROMPT_ARGS(request));
++    is_voice = request->source_chat_id &&
++               strcmp(request->source_chat_id, CLAW_CORE_VOICE_CHAT_ID) == 0;
++
++    if (is_voice) {
++        needed = snprintf(NULL, 0, CLAW_CORE_TURN_PROMPT_VOICE_FMT,
++                          CLAW_CORE_TURN_PROMPT_ARGS(request),
++                          CLAW_CORE_VOICE_REPLY_MAX_CHARS);
++    } else {
++        needed = snprintf(NULL, 0, CLAW_CORE_TURN_PROMPT_FMT, CLAW_CORE_TURN_PROMPT_ARGS(request));
++    }
+     if (needed < 0) {
+         ESP_LOGE(TAG, "failed to size current turn prompt");
+         text = NULL;
+@@ -157,7 +179,16 @@ static char *build_current_turn_prompt(const claw_core_request_t *request)
+         goto cleanup;
+     }
+ 
+-    if (snprintf(text, (size_t)needed + 1, CLAW_CORE_TURN_PROMPT_FMT, CLAW_CORE_TURN_PROMPT_ARGS(request)) < 0) {
++    if (is_voice) {
++        if (snprintf(text, (size_t)needed + 1, CLAW_CORE_TURN_PROMPT_VOICE_FMT,
++                     CLAW_CORE_TURN_PROMPT_ARGS(request),
++                     CLAW_CORE_VOICE_REPLY_MAX_CHARS) < 0) {
++            ESP_LOGE(TAG, "failed to build current turn prompt");
++            free(text);
++            text = NULL;
++        }
++    } else if (snprintf(text, (size_t)needed + 1, CLAW_CORE_TURN_PROMPT_FMT,
++                        CLAW_CORE_TURN_PROMPT_ARGS(request)) < 0) {
+         ESP_LOGE(TAG, "failed to build current turn prompt");
+         free(text);
+         text = NULL;
+@@ -165,6 +196,7 @@ static char *build_current_turn_prompt(const claw_core_request_t *request)
+ 
+ cleanup:
+ #undef CLAW_CORE_TURN_PROMPT_ARGS
++#undef CLAW_CORE_TURN_PROMPT_VOICE_FMT
+ #undef CLAW_CORE_TURN_PROMPT_FMT
+     return text;
+ }

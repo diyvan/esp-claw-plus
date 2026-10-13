@@ -12,7 +12,7 @@ Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5 开发板示例仓库（ESP32-P4 + 3.5" S
 - 本板禁用 `CONFIG_LOG_DEFAULT_LEVEL=4`（Debug）：PSRAM 调优的 DRAM 日志洪流会拖死启动。
 - ESP-IDF v6.1：`source /Users/diyvan/.espressif/tools/activate_idf_v6.1.sh`。
 - 串口 `/dev/tty.usbmodem5B910423531`；抓日志用 `scripts/capture_serial_log.py`（处理 USB 重枚举）。
-- agent 沙箱访问不了串口设备，烧录/抓日志需在沙箱外执行。
+- agent 沙箱**可以**访问串口设备（实测 `esptool flash-id/read-flash/write-flash` 均成功），烧录/抓日志可直接在沙箱内执行；打开串口会触发一次复位，需等启动完成后（约 15s）再交互。
 
 ## 仓库结构
 

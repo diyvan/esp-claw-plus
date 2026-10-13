@@ -8,8 +8,8 @@
  *   - Panel page: Home Assistant link state (configured / not configured and
  *     the base URL). Entity cards appear here once the HA WebSocket client is
  *     wired up; there is no mock data.
- *   - Voice page: wake status + last transcript + last reply (mirrored from
- *     the files the voice Lua skills write).
+ *   - Voice page: machine-readable status code + a scrollable conversation
+ *     history (mirrored from the files the voice Lua skills write).
  *   - Info page: ESP-Claw system status grouped as network / LLM / IM / voice
  *     state, all read from the same NVS-backed app_config the Web UI writes,
  *     plus the live WiFi status polled from wifi_manager.
@@ -64,15 +64,31 @@ static const char *TAG = "ha_panel";
 #define HA_PANEL_TASK_PRIO           4
 #define HA_PANEL_LOCK_TIMEOUT_MS     1000
 
-/* Voice text bridge: the voice Lua skills write these files under the writable
- * storage root (CLAW_PATH_DATA, physically /fatfs) and the panel polls them to
- * mirror the conversation on screen. No Lua->C display capability needed. */
+/* Voice bridge: the voice Lua skills (via the shared voice_common.lua) write
+ * these files under the writable storage root (CLAW_PATH_DATA, physically
+ * /fatfs) and the panel polls them to mirror the conversation on screen. No
+ * Lua->C display capability needed.
+ *
+ *   voice_status.txt  "<code>|<detail>"
+ *       `code` is a machine-readable token mapped here to a CJK label + busy
+ *       flag (HA_VOICE_STATUS_MAP); `detail` is optional自由 text (a failure
+ *       reason). Keeping the code and the wording apart means changing the
+ *       label never silently breaks the busy badge.
+ *   voice_log.txt     "<role>\x1f<text>\x1e" per record, role U(user)/A(agent)
+ *       Rendered as a scrollable bubble list. Buffers live in PSRAM to spare
+ *       the tight internal RAM. */
 #define HA_VOICE_STATUS_FILE         "voice_status.txt"
-#define HA_VOICE_USER_FILE           "voice_user.txt"
-#define HA_VOICE_AGENT_FILE          "voice_agent.txt"
-#define HA_VOICE_TEXT_MAX            768
-#define HA_VOICE_STATUS_MAX          64
+#define HA_VOICE_LOG_FILE            "voice_log.txt"
+#define HA_VOICE_TEXT_MAX            4096  /* max bytes per log record */
+#define HA_VOICE_LOG_MAX             8     /* bubbles rendered (matches Lua trim) */
+#define HA_VOICE_LOG_BYTES           (40 * 1024)  /* PSRAM read buffer / snapshot */
+#define HA_VOICE_STATUS_MAX          96
 #define HA_VOICE_POLL_CYCLES         20   /* every 20 * 10ms = 200ms */
+
+/* Record separators used by voice_common.lua (US between role/text, RS between
+ * records). LLM output never contains these control chars, so no escaping. */
+#define HA_VOICE_FIELD_SEP           '\x1f'
+#define HA_VOICE_RECORD_SEP          '\x1e'
 
 /* Runtime config bridge: the panel serialises the NVS-backed app_config to a
  * JSON file the voice Lua skills read. Same file-bridge idea as the transcript
@@ -130,11 +146,15 @@ static int s_font_attempts;
 static lv_obj_t *s_title_label;   /* static CJK labels that exist before font load */
 static lv_obj_t *s_hint_label;
 static lv_obj_t *s_status_label;
-static lv_obj_t *s_user_label;
-static lv_obj_t *s_agent_label;
-static char s_status_text[HA_VOICE_STATUS_MAX];
-static char s_user_text[HA_VOICE_TEXT_MAX];
-static char s_agent_text[HA_VOICE_TEXT_MAX];
+static lv_obj_t *s_voice_log;     /* scrollable conversation bubble list */
+static char s_status_raw[HA_VOICE_STATUS_MAX];   /* last "<code>|<detail>" */
+
+/* Conversation bridge buffers. They live in PSRAM: 40 KB read + snapshot would
+ * not fit the tight internal RAM and the render path never needs DMA memory.
+ * Allocation is best-effort; when NULL the poll degrades to a no-op. */
+static char *s_voice_log_buf;     /* raw bytes read back from voice_log.txt */
+static char *s_voice_log_snap;    /* last-rendered snapshot, compared to skip */
+static char *s_voice_line;        /* scratch for one rendered bubble line */
 
 /* Panel page: Home Assistant link state (no mock entities). */
 static lv_obj_t *s_panel_ha_state_label;
@@ -382,6 +402,25 @@ static bool ha_panel_read_text(const char *name, char *out, size_t out_size)
     return true;
 }
 
+/* Binary-safe read of a file under the data root: NUL-terminated, but CR/LF and
+ * the \x1f/\x1e record separators are preserved (the conversation log encodes
+ * its records with control chars). Returns false when the file is missing. */
+static bool ha_panel_read_raw(const char *name, char *out, size_t out_size)
+{
+    char path[128];
+    if (!ha_panel_data_path(name, path, sizeof(path))) {
+        return false;
+    }
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return false;
+    }
+    size_t n = fread(out, 1, out_size - 1, file);
+    fclose(file);
+    out[n] = '\0';
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* Page navigation                                                    */
 /* ------------------------------------------------------------------ */
@@ -418,47 +457,178 @@ static void ha_panel_tab_click_cb(lv_event_t *e)
 }
 
 /* ------------------------------------------------------------------ */
-/* Voice text bridge (Lua writes files, panel mirrors them)            */
+/* Voice bridge (Lua writes files, panel mirrors them)                 */
 /* ------------------------------------------------------------------ */
 
-static void ha_panel_poll_voice(void)
+/* Map a machine-readable status code (written by voice_common.lua) to the CJK
+ * label shown on the panel and whether the voice tab badge should light. An
+ * unknown code is treated as busy with a "未知" label so a future Lua code
+ * never silently freezes the badge. */
+typedef struct {
+    const char *code;
+    const char *label;
+    bool busy;
+} ha_voice_status_t;
+
+static const ha_voice_status_t s_voice_status_map[] = {
+    { "idle",         "空闲",   false },
+    { "recording",    "录音中", true  },
+    { "recognizing",  "识别中", true  },
+    { "thinking",     "思考中", true  },
+    { "synthesizing", "合成中", true  },
+    { "speaking",     "播报中", true  },
+    { "error",        "出错",   true  },
+};
+
+/* Mirror voice_status.txt ("<code>|<detail>") onto the status label + tab dot. */
+static void ha_panel_poll_status(void)
 {
-    char buf[HA_VOICE_TEXT_MAX];
-    char display[HA_VOICE_TEXT_MAX + 16];
+    if (!s_status_label) {
+        return;
+    }
+    char raw[HA_VOICE_STATUS_MAX];
+    if (!ha_panel_read_text(HA_VOICE_STATUS_FILE, raw, sizeof(raw)) ||
+            strcmp(raw, s_status_raw) == 0) {
+        return;
+    }
+    strlcpy(s_status_raw, raw, sizeof(s_status_raw));
 
-    ha_panel_ensure_font();
+    /* Split "<code>|<detail>"; detail is optional free text (failure reason). */
+    const char *code = raw;
+    const char *detail = strchr(raw, '|');
+    char code_buf[32];
+    if (detail) {
+        size_t n = (size_t)(detail - raw);
+        if (n >= sizeof(code_buf)) {
+            n = sizeof(code_buf) - 1;
+        }
+        memcpy(code_buf, raw, n);
+        code_buf[n] = '\0';
+        code = code_buf;
+        detail++;
+    }
 
-    if (s_status_label && ha_panel_read_text(HA_VOICE_STATUS_FILE, buf, sizeof(buf)) &&
-            strcmp(buf, s_status_text) != 0) {
-        strlcpy(s_status_text, buf, sizeof(s_status_text));
-        snprintf(display, sizeof(display), "状态: %s", s_status_text[0] ? s_status_text : "空闲");
-        lv_label_set_text(s_status_label, display);
-        ESP_LOGI(TAG, "voice status: %s", s_status_text);
-        if (s_voice_badge) {
-            bool busy = strcmp(s_status_text, "空闲") != 0 && strcmp(s_status_text, "idle") != 0;
-            if (busy) {
-                lv_obj_remove_flag(s_voice_badge, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                lv_obj_add_flag(s_voice_badge, LV_OBJ_FLAG_HIDDEN);
-            }
+    const char *label = "未知";
+    bool busy = true;   /* unknown code: assume a job is running */
+    for (size_t i = 0; i < sizeof(s_voice_status_map) / sizeof(s_voice_status_map[0]); i++) {
+        if (strcmp(code, s_voice_status_map[i].code) == 0) {
+            label = s_voice_status_map[i].label;
+            busy = s_voice_status_map[i].busy;
+            break;
         }
     }
 
-    if (s_user_label && ha_panel_read_text(HA_VOICE_USER_FILE, buf, sizeof(buf)) &&
-            strcmp(buf, s_user_text) != 0) {
-        strlcpy(s_user_text, buf, sizeof(s_user_text));
-        snprintf(display, sizeof(display), "你说: %s", s_user_text[0] ? s_user_text : "-");
-        lv_label_set_text(s_user_label, display);
-        ESP_LOGI(TAG, "voice user: %s", s_user_text);
+    char display[HA_VOICE_STATUS_MAX + 32];
+    if (detail && detail[0]) {
+        snprintf(display, sizeof(display), "状态: %s · %s", label, detail);
+    } else {
+        snprintf(display, sizeof(display), "状态: %s", label);
+    }
+    lv_label_set_text(s_status_label, display);
+    ESP_LOGI(TAG, "voice status: code=%s detail=%s", code, (detail && detail[0]) ? detail : "-");
+
+    if (s_voice_badge) {
+        if (busy) {
+            lv_obj_remove_flag(s_voice_badge, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_voice_badge, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+/* Create one conversation bubble. The "你说:"/"AI 说:" prefix + text is built
+ * in the PSRAM scratch buffer so a long reply never touches the 8 KB task
+ * stack. Returns the created label (callers scroll the last one into view). */
+static lv_obj_t *ha_panel_make_bubble(lv_obj_t *parent, char role, const char *text, size_t len)
+{
+    if (!s_voice_line) {
+        return NULL;
+    }
+    const char *prefix = (role == 'A') ? "AI 说: " : "你说: ";
+    size_t plen = strlen(prefix);
+    size_t cap = HA_VOICE_TEXT_MAX + 16;
+    if (plen >= cap) {
+        return NULL;
+    }
+    memcpy(s_voice_line, prefix, plen);
+    size_t copy = len;
+    if (plen + copy >= cap) {
+        copy = cap - plen - 1;
+    }
+    memcpy(s_voice_line + plen, text, copy);
+    s_voice_line[plen + copy] = '\0';
+
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, s_voice_line);
+    lv_obj_set_style_text_color(label, lv_color_hex(role == 'A' ? HA_COLOR_ON : HA_COLOR_TEXT), 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(label, LV_PCT(100));
+    return label;
+}
+
+/* Rebuild the bubble list from s_voice_log_buf ("<role>\x1f<text>\x1e" per
+ * record). Parses the freshly-read buffer in place (not the snapshot, which
+ * must stay intact for the next strcmp); renders only the newest records. */
+static void ha_panel_rebuild_log(void)
+{
+    if (!s_voice_log || !s_voice_log_buf) {
+        return;
     }
 
-    if (s_agent_label && ha_panel_read_text(HA_VOICE_AGENT_FILE, buf, sizeof(buf)) &&
-            strcmp(buf, s_agent_text) != 0) {
-        strlcpy(s_agent_text, buf, sizeof(s_agent_text));
-        snprintf(display, sizeof(display), "AI 说: %s", s_agent_text[0] ? s_agent_text : "-");
-        lv_label_set_text(s_agent_label, display);
-        ESP_LOGI(TAG, "voice agent: %s", s_agent_text);
+    char *recs[HA_VOICE_LOG_MAX * 2];
+    size_t rec_len[HA_VOICE_LOG_MAX * 2];
+    size_t rec_count = 0;
+
+    char *p = s_voice_log_buf;
+    while (*p && rec_count < sizeof(recs) / sizeof(recs[0])) {
+        char *rs = strchr(p, HA_VOICE_RECORD_SEP);
+        recs[rec_count] = p;
+        rec_len[rec_count] = rs ? (size_t)(rs - p) : strlen(p);
+        rec_count++;
+        if (!rs) {
+            break;
+        }
+        *rs = '\0';
+        p = rs + 1;
     }
+
+    size_t start = (rec_count > HA_VOICE_LOG_MAX) ? (rec_count - HA_VOICE_LOG_MAX) : 0;
+
+    lv_obj_clean(s_voice_log);
+    lv_obj_t *last = NULL;
+    for (size_t i = start; i < rec_count; i++) {
+        char *rec = recs[i];
+        char role = rec[0];
+        char *fs = memchr(rec, HA_VOICE_FIELD_SEP, rec_len[i]);
+        const char *text = fs ? fs + 1 : "";
+        size_t tlen = fs ? rec_len[i] - (size_t)(fs + 1 - rec) : 0;
+        last = ha_panel_make_bubble(s_voice_log, role, text, tlen);
+    }
+    if (last) {
+        lv_obj_scroll_to_view(last, LV_ANIM_OFF);
+    }
+    ESP_LOGI(TAG, "voice log rebuilt: %u record(s)", (unsigned)rec_count);
+}
+
+/* Mirror voice_log.txt onto the scrollable bubble list, only when it changed. */
+static void ha_panel_poll_voice_log(void)
+{
+    if (!s_voice_log || !s_voice_log_buf || !s_voice_log_snap) {
+        return;
+    }
+    if (!ha_panel_read_raw(HA_VOICE_LOG_FILE, s_voice_log_buf, HA_VOICE_LOG_BYTES) ||
+            strcmp(s_voice_log_buf, s_voice_log_snap) == 0) {
+        return;
+    }
+    strlcpy(s_voice_log_snap, s_voice_log_buf, HA_VOICE_LOG_BYTES);
+    ha_panel_rebuild_log();
+}
+
+static void ha_panel_poll_voice(void)
+{
+    ha_panel_ensure_font();
+    ha_panel_poll_status();
+    ha_panel_poll_voice_log();
 }
 
 /* The screen can be taken back from the panel at runtime (e.g. the Lua
@@ -935,18 +1105,22 @@ static void ha_panel_build_voice_page(lv_obj_t *page)
     lv_label_set_text(s_status_label, "状态: 空闲");
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(HA_COLOR_TEXT_DIM), 0);
 
-    s_user_label = lv_label_create(voice);
-    lv_label_set_text(s_user_label, "你说: -");
-    lv_obj_set_style_text_color(s_user_label, lv_color_hex(HA_COLOR_TEXT), 0);
-    lv_label_set_long_mode(s_user_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_user_label, LV_PCT(100));
-
-    s_agent_label = lv_label_create(voice);
-    lv_label_set_text(s_agent_label, "AI 说: -");
-    lv_obj_set_style_text_color(s_agent_label, lv_color_hex(HA_COLOR_ON), 0);
-    /* Replies can be long; scroll them in place instead of clipping. */
-    lv_label_set_long_mode(s_agent_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(s_agent_label, LV_PCT(100));
+    /* Scrollable conversation history: one bubble per record, newest at the
+     * bottom. Transparent container so only the bubbles show against the card;
+     * the status line above stays pinned while the log scrolls. */
+    lv_obj_t *log = lv_obj_create(voice);
+    lv_obj_set_width(log, LV_PCT(100));
+    lv_obj_set_flex_grow(log, 1);
+    lv_obj_set_style_bg_opa(log, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(log, 0, 0);
+    lv_obj_set_style_pad_all(log, 0, 0);
+    lv_obj_set_style_pad_row(log, 6, 0);
+    lv_obj_set_flex_flow(log, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(log, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_add_flag(log, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(log, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(log, LV_SCROLLBAR_MODE_AUTO);
+    s_voice_log = log;
 }
 
 static void ha_panel_build_info_page(lv_obj_t *page)
@@ -1189,6 +1363,17 @@ esp_err_t ha_panel_start(void)
         lv_indev_set_read_cb(indev, ha_panel_touch_read_cb);
         lv_indev_set_user_data(indev, s_touch);
         lv_indev_set_display(indev, display);
+    }
+
+    /* Conversation bridge buffers (40 KB read buffer + 40 KB snapshot + the
+     * bubble line scratch) go to PSRAM: internal RAM is too tight and these are
+     * never touched by DMA. Best-effort; on failure the poll degrades to a
+     * no-op rather than aborting the panel. */
+    s_voice_log_buf = heap_caps_calloc(1, HA_VOICE_LOG_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_voice_log_snap = heap_caps_calloc(1, HA_VOICE_LOG_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_voice_line = heap_caps_malloc(HA_VOICE_TEXT_MAX + 16, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_voice_log_buf || !s_voice_log_snap || !s_voice_line) {
+        ESP_LOGW(TAG, "voice bridge PSRAM buffers unavailable; conversation mirror disabled");
     }
 
     ha_panel_build_ui();

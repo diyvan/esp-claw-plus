@@ -1,0 +1,770 @@
+diff --git a/application/edge_agent/main/idf_component.yml b/application/edge_agent/main/idf_component.yml
+index 8220164..e8ec969 100644
+--- a/application/edge_agent/main/idf_component.yml
++++ b/application/edge_agent/main/idf_component.yml
+@@ -48,6 +48,10 @@ dependencies:
+   http_reuse:
+     path: ../../../components/common/http_reuse
+ 
++  # TTS 真·边收边播: HTTP 流式 + base64 增量解码 + 环形缓冲, 供 audio.player 的 raw:// 输入回调拉取。
++  cap_tts_stream:
++    path: ../../../components/claw_capabilities/cap_tts_stream
++
+   http_server:
+     path: ../components/http_server
+ 
+diff --git a/components/claw_capabilities/cap_tts_stream/CMakeLists.txt b/components/claw_capabilities/cap_tts_stream/CMakeLists.txt
+new file mode 100644
+index 0000000..4631c34
+--- /dev/null
++++ b/components/claw_capabilities/cap_tts_stream/CMakeLists.txt
+@@ -0,0 +1,11 @@
++idf_component_register(
++    SRCS
++        "src/cap_tts_stream.c"
++    INCLUDE_DIRS
++        "include"
++    REQUIRES
++        esp_http_client
++        mbedtls
++        cjson
++        freertos
++)
+diff --git a/components/claw_capabilities/cap_tts_stream/idf_component.yml b/components/claw_capabilities/cap_tts_stream/idf_component.yml
+new file mode 100644
+index 0000000..c093387
+--- /dev/null
++++ b/components/claw_capabilities/cap_tts_stream/idf_component.yml
+@@ -0,0 +1 @@
++dependencies: {}
+diff --git a/components/claw_capabilities/cap_tts_stream/include/cap_tts_stream.h b/components/claw_capabilities/cap_tts_stream/include/cap_tts_stream.h
+new file mode 100644
+index 0000000..78b1085
+--- /dev/null
++++ b/components/claw_capabilities/cap_tts_stream/include/cap_tts_stream.h
+@@ -0,0 +1,57 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++#include "esp_err.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * TTS 单向流式音频源 (边收边播)。
++ *
++ * 用法: 后台任务对 url 发起 POST, 增量解析 `{"code":0,"data":"<base64>"}` 形式的流式
++ * JSON, 把 data 解码后的音频字节推入内部环形缓冲; 音频播放器通过 cap_tts_stream_read()
++ * 以 raw:// 输入回调的形式拉取, 实现"边收边解码边播放"。
++ *
++ * 同一时刻只允许一个会话 (语音链路本身串行)。
++ */
++
++/**
++ * @brief 启动一个 TTS 流式会话 (后台任务异步执行)。
++ *
++ * @param[in] url         TTS endpoint (http/https)
++ * @param[in] headers     原始 header 块 (形如 "Name: Value\r\nName2: Value2\r\n"), 可为 NULL
++ * @param[in] body        POST body (JSON 字符串)
++ * @param[in] timeout_ms  HTTP socket 超时 (毫秒), <=0 取默认值
++ * @return ESP_OK 成功; 其它为失败 (参数错误 / 内存不足)
++ */
++esp_err_t cap_tts_stream_begin(const char *url, const char *headers, const char *body, int timeout_ms);
++
++/**
++ * @brief 从环形缓冲拉取最多 size 字节, 供 esp_audio_simple_player 的 raw:// 输入回调使用。
++ *        阻塞直到填满 size 字节、流结束、或超时。
++ *
++ * @return >0 实际读到的字节数 (== size 表示还有后续); 0 表示流已结束 (EOF); 负数表示错误
++ */
++int cap_tts_stream_read(uint8_t *data, int size, uint32_t timeout_ms);
++
++/**
++ * @brief 结束会话: 中止后台任务并释放缓冲。可重复调用 (幂等)。
++ */
++void cap_tts_stream_end(void);
++
++/**
++ * @brief 会话是否仍在进行 (HTTP 接收未结束)。
++ */
++bool cap_tts_stream_active(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/components/claw_capabilities/cap_tts_stream/src/cap_tts_stream.c b/components/claw_capabilities/cap_tts_stream/src/cap_tts_stream.c
+new file mode 100644
+index 0000000..a7b04a1
+--- /dev/null
++++ b/components/claw_capabilities/cap_tts_stream/src/cap_tts_stream.c
+@@ -0,0 +1,429 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#include "cap_tts_stream.h"
++
++#include <ctype.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "cJSON.h"
++#include "esp_crt_bundle.h"
++#include "esp_http_client.h"
++#include "esp_log.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/stream_buffer.h"
++#include "freertos/task.h"
++#include "mbedtls/base64.h"
++
++static const char *TAG = "tts_stream";
++
++#define TTS_STREAM_SB_BYTES      (48 * 1024)
++#define TTS_STREAM_TASK_STACK    8192
++#define TTS_STREAM_TASK_PRIO     5
++#define TTS_STREAM_READ_CHUNK    512
++#define TTS_STREAM_DEFAULT_TO_MS 20000
++#define TTS_STREAM_SEND_TO_MS    1000
++
++typedef struct {
++    StreamBufferHandle_t sb;
++    TaskHandle_t task;
++    volatile bool running;
++    volatile bool abort;
++    volatile bool eof;
++
++    /* 会话参数 (由 begin 深拷贝, task 结束时释放) */
++    char *url;
++    char *headers;
++    char *body;
++    int timeout_ms;
++
++    /* 增量扫描 '"data"' + ':' + '"' + <base64> + '"' 的中间状态 (仅 task 使用) */
++    char *pending;
++    size_t pending_len;
++    size_t pending_cap;
++    uint8_t *scratch;
++    size_t scratch_cap;
++    bool in_value;
++    size_t pushed_bytes;
++} tts_stream_ctx_t;
++
++static tts_stream_ctx_t s_ctx;
++
++static const char TTS_FIELD_PATTERN[] = "\"data\"";
++
++static char *tts_find_char(const char *buf, size_t len, char c)
++{
++    for (size_t i = 0; i < len; i++) {
++        if (buf[i] == c) {
++            return (char *)(buf + i);
++        }
++    }
++    return NULL;
++}
++
++static char *tts_find_bytes(const char *buf, size_t len, const char *pat, size_t pat_len)
++{
++    if (pat_len == 0 || len < pat_len) {
++        return NULL;
++    }
++    for (size_t i = 0; i + pat_len <= len; i++) {
++        if (memcmp(buf + i, pat, pat_len) == 0) {
++            return (char *)(buf + i);
++        }
++    }
++    return NULL;
++}
++
++/* 把已解码的音频字节推入环形缓冲; 带背压 (缓冲满时阻塞等待消费端拉取)。 */
++static void tts_stream_push(const uint8_t *data, size_t len)
++{
++    size_t off = 0;
++
++    while (off < len && !s_ctx.abort) {
++        size_t sent = xStreamBufferSend(s_ctx.sb, data + off, len - off,
++                                        pdMS_TO_TICKS(TTS_STREAM_SEND_TO_MS));
++        if (sent == 0) {
++            /* 消费端长时间不拉取 (播放已停止) 或已 abort, 放弃剩余数据。 */
++            ESP_LOGW(TAG, "ring buffer stalled, dropping %zu bytes", len - off);
++            break;
++        }
++        off += sent;
++    }
++    s_ctx.pushed_bytes += off;
++}
++
++/* 解码一个 base64 分块并推入环形缓冲。坏块只告警跳过, 尽量保留可用音频。 */
++static void tts_stream_decode_chunk(const char *b64, size_t b64_len)
++{
++    size_t out_len = 0;
++    size_t need;
++
++    if (b64_len == 0) {
++        return;
++    }
++    need = ((b64_len + 3) / 4) * 3 + 4;
++    if (need > s_ctx.scratch_cap) {
++        uint8_t *grown = realloc(s_ctx.scratch, need);
++        if (!grown) {
++            ESP_LOGE(TAG, "out of memory for decode scratch");
++            return;
++        }
++        s_ctx.scratch = grown;
++        s_ctx.scratch_cap = need;
++    }
++    if (mbedtls_base64_decode(s_ctx.scratch, s_ctx.scratch_cap, &out_len,
++                              (const unsigned char *)b64, b64_len) != 0) {
++        ESP_LOGW(TAG, "base64 decode failed for a %zu-byte chunk", b64_len);
++        return;
++    }
++    if (out_len > 0) {
++        tts_stream_push(s_ctx.scratch, out_len);
++    }
++}
++
++/* 从 pending 缓冲增量扫描 '"data"' ':' '"' <base64> '"' 并逐块解码;
++ * 未闭合片段保留到下一批数据, 因此可跨 HTTP chunk 边界。 */
++static void tts_stream_scan(void)
++{
++    const size_t pat_len = sizeof(TTS_FIELD_PATTERN) - 1;
++    size_t pos = 0;
++
++    for (;;) {
++        size_t avail = s_ctx.pending_len - pos;
++
++        if (!s_ctx.in_value) {
++            char *hit = tts_find_bytes(s_ctx.pending + pos, avail, TTS_FIELD_PATTERN, pat_len);
++            size_t k;
++            size_t j;
++
++            if (!hit) {
++                /* 保留可能是被截断的模式前缀 (如结尾的 '"dat') */
++                size_t keep = pat_len - 1;
++                pos = (avail > keep) ? (s_ctx.pending_len - keep) : pos;
++                break;
++            }
++            k = (size_t)(hit - s_ctx.pending);
++            j = k + pat_len;
++            while (j < s_ctx.pending_len && isspace((unsigned char)s_ctx.pending[j])) {
++                j++;
++            }
++            if (j >= s_ctx.pending_len) {
++                pos = k;
++                break;
++            }
++            if (s_ctx.pending[j] != ':') {
++                pos = k + 1;
++                continue;
++            }
++            j++;
++            while (j < s_ctx.pending_len && isspace((unsigned char)s_ctx.pending[j])) {
++                j++;
++            }
++            if (j >= s_ctx.pending_len) {
++                pos = k;
++                break;
++            }
++            if (s_ctx.pending[j] != '"') {
++                /* 如 "data":null —— 此处没有 base64 值, 从该位置继续扫描 */
++                pos = j;
++                continue;
++            }
++            s_ctx.in_value = true;
++            pos = j + 1;
++        } else {
++            char *end = tts_find_char(s_ctx.pending + pos, s_ctx.pending_len - pos, '"');
++            size_t q;
++
++            if (!end) {
++                break;
++            }
++            q = (size_t)(end - s_ctx.pending);
++            tts_stream_decode_chunk(s_ctx.pending + pos, q - pos);
++            s_ctx.in_value = false;
++            pos = q + 1;
++        }
++    }
++
++    if (pos > 0) {
++        memmove(s_ctx.pending, s_ctx.pending + pos, s_ctx.pending_len - pos);
++        s_ctx.pending_len -= pos;
++    }
++}
++
++static bool tts_stream_pending_append(const char *data, size_t len)
++{
++    if (s_ctx.pending_len + len + 1 > s_ctx.pending_cap) {
++        size_t new_cap = s_ctx.pending_cap ? s_ctx.pending_cap * 2 : 8192;
++        char *grown;
++
++        if (new_cap < s_ctx.pending_len + len + 1) {
++            new_cap = s_ctx.pending_len + len + 1;
++        }
++        grown = realloc(s_ctx.pending, new_cap);
++        if (!grown) {
++            ESP_LOGE(TAG, "out of memory for pending buffer");
++            return false;
++        }
++        s_ctx.pending = grown;
++        s_ctx.pending_cap = new_cap;
++    }
++    memcpy(s_ctx.pending + s_ctx.pending_len, data, len);
++    s_ctx.pending_len += len;
++    s_ctx.pending[s_ctx.pending_len] = '\0';
++    return true;
++}
++
++static void tts_stream_apply_headers(esp_http_client_handle_t client, const char *headers)
++{
++    char *copy;
++    char *save = NULL;
++
++    if (!headers || !headers[0]) {
++        return;
++    }
++    copy = strdup(headers);
++    if (!copy) {
++        return;
++    }
++    for (char *line = strtok_r(copy, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save)) {
++        char *colon = strchr(line, ':');
++        char *value;
++
++        if (!colon) {
++            continue;
++        }
++        *colon = '\0';
++        value = colon + 1;
++        while (*value == ' ') {
++            value++;
++        }
++        if (line[0]) {
++            esp_http_client_set_header(client, line, value);
++        }
++    }
++    free(copy);
++}
++
++static void tts_stream_task(void *arg)
++{
++    tts_stream_ctx_t *ctx = (tts_stream_ctx_t *)arg;
++    esp_http_client_config_t config = {
++        .url = ctx->url,
++        .method = HTTP_METHOD_POST,
++        .timeout_ms = ctx->timeout_ms > 0 ? ctx->timeout_ms : TTS_STREAM_DEFAULT_TO_MS,
++        .buffer_size = 4096,
++        .crt_bundle_attach = esp_crt_bundle_attach,
++        .disable_auto_redirect = true,
++    };
++    esp_http_client_handle_t client = esp_http_client_init(&config);
++    char chunk[TTS_STREAM_READ_CHUNK];
++    int body_len = (int)strlen(ctx->body);
++    int status = 0;
++
++    if (!client) {
++        ESP_LOGE(TAG, "http client init failed");
++        goto done;
++    }
++    tts_stream_apply_headers(client, ctx->headers);
++    esp_http_client_set_header(client, "Content-Type", "application/json");
++
++    if (esp_http_client_open(client, body_len) != ESP_OK) {
++        ESP_LOGE(TAG, "http open failed");
++        esp_http_client_cleanup(client);
++        goto done;
++    }
++    if (esp_http_client_write(client, ctx->body, body_len) != body_len) {
++        ESP_LOGE(TAG, "http write failed");
++        esp_http_client_cleanup(client);
++        goto done;
++    }
++    esp_http_client_fetch_headers(client);
++    status = esp_http_client_get_status_code(client);
++    if (status < 200 || status >= 300) {
++        ESP_LOGE(TAG, "TTS http status=%d", status);
++        esp_http_client_cleanup(client);
++        goto done;
++    }
++
++    for (;;) {
++        int r;
++
++        if (ctx->abort) {
++            break;
++        }
++        r = esp_http_client_read(client, chunk, sizeof(chunk));
++        if (r <= 0) {
++            break;
++        }
++        if (!tts_stream_pending_append(chunk, (size_t)r)) {
++            break;
++        }
++        tts_stream_scan();
++    }
++
++    /* 处理收尾残留 (未以 '"' 闭合的尾部直接丢弃) */
++    tts_stream_scan();
++    esp_http_client_cleanup(client);
++
++done:
++    ESP_LOGI(TAG, "session done: pushed=%zu bytes, status=%d", ctx->pushed_bytes, status);
++    ctx->eof = true;
++    ctx->running = false;
++    vTaskDelete(NULL);
++}
++
++esp_err_t cap_tts_stream_begin(const char *url, const char *headers, const char *body, int timeout_ms)
++{
++    if (!url || !body) {
++        return ESP_ERR_INVALID_ARG;
++    }
++    /* 清理上一个会话可能残留的资源 (即使其后台任务已自然结束) */
++    cap_tts_stream_end();
++
++    s_ctx.abort = false;
++    s_ctx.eof = false;
++    s_ctx.in_value = false;
++    s_ctx.pending_len = 0;
++    s_ctx.pushed_bytes = 0;
++    s_ctx.url = strdup(url);
++    s_ctx.headers = headers ? strdup(headers) : NULL;
++    s_ctx.body = strdup(body);
++    s_ctx.timeout_ms = timeout_ms;
++    if (!s_ctx.url || !s_ctx.body) {
++        goto fail;
++    }
++    s_ctx.sb = xStreamBufferCreate(TTS_STREAM_SB_BYTES, 1);
++    if (!s_ctx.sb) {
++        ESP_LOGE(TAG, "stream buffer create failed");
++        goto fail;
++    }
++    s_ctx.running = true;
++    if (xTaskCreate(tts_stream_task, "tts_stream", TTS_STREAM_TASK_STACK, &s_ctx,
++                    TTS_STREAM_TASK_PRIO, &s_ctx.task) != pdPASS) {
++        ESP_LOGE(TAG, "task create failed");
++        s_ctx.running = false;
++        vStreamBufferDelete(s_ctx.sb);
++        s_ctx.sb = NULL;
++        goto fail;
++    }
++    return ESP_OK;
++
++fail:
++    free(s_ctx.url);
++    free(s_ctx.headers);
++    free(s_ctx.body);
++    s_ctx.url = NULL;
++    s_ctx.headers = NULL;
++    s_ctx.body = NULL;
++    return ESP_ERR_NO_MEM;
++}
++
++int cap_tts_stream_read(uint8_t *data, int size, uint32_t timeout_ms)
++{
++    size_t got = 0;
++
++    if (!data || size <= 0) {
++        return -1;
++    }
++    if (!s_ctx.sb) {
++        return 0;
++    }
++    while (got < (size_t)size) {
++        size_t n = xStreamBufferReceive(s_ctx.sb, data + got, (size_t)size - got,
++                                        pdMS_TO_TICKS(timeout_ms));
++        if (n > 0) {
++            got += n;
++            continue;
++        }
++        break;  /* eof / abort / 超时: 返回已读部分 */
++    }
++    if (got == 0 && !s_ctx.eof) {
++        ESP_LOGW(TAG, "read timeout with no data (eof=%d, running=%d)",
++                 (int)s_ctx.eof, (int)s_ctx.running);
++    }
++    return (int)got;
++}
++
++bool cap_tts_stream_active(void)
++{
++    return s_ctx.running;
++}
++
++void cap_tts_stream_end(void)
++{
++    if (!s_ctx.sb && !s_ctx.running && !s_ctx.url) {
++        return;
++    }
++    s_ctx.abort = true;
++    /* 等后台任务自行收尾 (HTTP read 会周期性返回, 通常 <200ms) */
++    for (int i = 0; i < 300 && s_ctx.running; i++) {
++        vTaskDelay(pdMS_TO_TICKS(10));
++    }
++    if (s_ctx.running) {
++        ESP_LOGW(TAG, "task did not exit in time, force delete");
++        vTaskDelete(s_ctx.task);
++        s_ctx.running = false;
++    }
++    if (s_ctx.sb) {
++        vStreamBufferDelete(s_ctx.sb);
++        s_ctx.sb = NULL;
++    }
++    free(s_ctx.url);
++    free(s_ctx.headers);
++    free(s_ctx.body);
++    s_ctx.url = NULL;
++    s_ctx.headers = NULL;
++    s_ctx.body = NULL;
++    free(s_ctx.pending);
++    s_ctx.pending = NULL;
++    s_ctx.pending_cap = 0;
++    s_ctx.pending_len = 0;
++    free(s_ctx.scratch);
++    s_ctx.scratch = NULL;
++    s_ctx.scratch_cap = 0;
++    s_ctx.in_value = false;
++    s_ctx.eof = false;
++}
+diff --git a/components/lua_modules/lua_module_audio/CMakeLists.txt b/components/lua_modules/lua_module_audio/CMakeLists.txt
+index a4d8389..418548e 100644
+--- a/components/lua_modules/lua_module_audio/CMakeLists.txt
++++ b/components/lua_modules/lua_module_audio/CMakeLists.txt
+@@ -5,6 +5,7 @@ idf_component_register(
+         "src"
+     REQUIRES
+         cap_lua
++        cap_tts_stream
+         esp_codec_dev
+         esp-dsp
+         esp_audio_codec
+diff --git a/components/lua_modules/lua_module_audio/idf_component.yml b/components/lua_modules/lua_module_audio/idf_component.yml
+index dc73970..2fd4780 100644
+--- a/components/lua_modules/lua_module_audio/idf_component.yml
++++ b/components/lua_modules/lua_module_audio/idf_component.yml
+@@ -1,5 +1,8 @@
+ ## IDF Component Manager Manifest File
+ dependencies:
++  cap_tts_stream:
++    path: ../../claw_capabilities/cap_tts_stream
++
+   espressif/esp_codec_dev: "*"
+   espressif/esp-dsp: "*"
+   espressif/esp_audio_codec: "*"
+diff --git a/components/lua_modules/lua_module_audio/src/audio_player.c b/components/lua_modules/lua_module_audio/src/audio_player.c
+index 4322bb7..0371489 100644
+--- a/components/lua_modules/lua_module_audio/src/audio_player.c
++++ b/components/lua_modules/lua_module_audio/src/audio_player.c
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ #include "audio_private.h"
++#include "cap_tts_stream.h"
+ 
+ static esp_err_t audio_player_create_converter(audio_player_t *player, const audio_format_t *src)
+ {
+@@ -110,6 +111,13 @@ static int audio_player_out_cb(uint8_t *data, int data_size, void *ctx)
+     return ret;
+ }
+ 
++/* raw:// 流式输入回调: 从 cap_tts_stream 的环形缓冲拉取, 边收边解码边播放。 */
++static int audio_player_in_cb(uint8_t *data, int data_size, void *ctx)
++{
++    (void)ctx;
++    return cap_tts_stream_read(data, data_size, 5000);
++}
++
+ static int audio_player_event_cb(esp_asp_event_pkt_t *pkt, void *ctx)
+ {
+     audio_player_t *player = (audio_player_t *)ctx;
+@@ -157,6 +165,10 @@ int lua_audio_player_new(lua_State *L)
+     }
+ 
+     esp_asp_cfg_t cfg = {
++        .in = {
++            .cb = audio_player_in_cb,
++            .user_ctx = player,
++        },
+         .out = {
+             .cb = audio_player_out_cb,
+             .user_ctx = player,
+@@ -202,6 +214,7 @@ int lua_audio_player_close(lua_State *L)
+         player->asp = NULL;
+     }
+     audio_converter_destroy(&player->converter);
++    cap_tts_stream_end();
+     if (player->output) {
+         if (player->output->holders > 0) {
+             player->output->holders--;
+@@ -301,10 +314,118 @@ int lua_audio_player_play(lua_State *L)
+     return 1;
+ }
+ 
++/* 把 Lua 表 {Name=Value, ...} 拼成 "Name: Value\r\n" 原始 header 块。返回 malloc 字符串 (调用方 free)。 */
++static char *audio_player_build_headers(lua_State *L, int idx)
++{
++    size_t cap = 256;
++    size_t len = 0;
++    char *buf = (char *)malloc(cap);
++
++    if (!buf) {
++        return NULL;
++    }
++    buf[0] = '\0';
++    lua_pushnil(L);
++    while (lua_next(L, idx) != 0) {
++        if (lua_type(L, -2) == LUA_TSTRING && lua_type(L, -1) == LUA_TSTRING) {
++            const char *name = lua_tostring(L, -2);
++            const char *value = lua_tostring(L, -1);
++            size_t need = strlen(name) + strlen(value) + 4;
++
++            if (len + need + 1 > cap) {
++                char *grown;
++
++                while (len + need + 1 > cap) {
++                    cap *= 2;
++                }
++                grown = (char *)realloc(buf, cap);
++                if (!grown) {
++                    free(buf);
++                    lua_pop(L, 2);
++                    return NULL;
++                }
++                buf = grown;
++            }
++            len += (size_t)snprintf(buf + len, cap - len, "%s: %s\r\n", name, value);
++        }
++        lua_pop(L, 1);
++    }
++    return buf;
++}
++
++/* 边收边播: 对 url 发起 TTS 流式请求, 通过 raw:// 播放器边走边解码边播放。
++ * opts: { url=<string>, headers=<table {Name=Value,...}|nil>, body=<string>, timeout_ms=<int|nil> } */
++int lua_audio_player_play_stream(lua_State *L)
++{
++    audio_player_t *player = lua_audio_check_player(L, 1, "play_stream");
++    const char *url;
++    const char *body;
++    char *headers = NULL;
++    int timeout_ms = 0;
++    char *uri = NULL;
++    esp_gmf_err_t ret;
++
++    luaL_checktype(L, 2, LUA_TTABLE);
++
++    lua_getfield(L, 2, "url");          /* +1 */
++    url = luaL_checkstring(L, -1);
++    lua_getfield(L, 2, "headers");      /* +2 */
++    if (lua_istable(L, -1)) {
++        headers = audio_player_build_headers(L, lua_gettop(L));
++    }
++    lua_getfield(L, 2, "body");         /* +3 */
++    body = luaL_checkstring(L, -1);
++    lua_getfield(L, 2, "timeout_ms");   /* +4 */
++    timeout_ms = lua_isnil(L, -1) ? 0 : (int)luaL_checkinteger(L, -1);
++
++    if (!audio_device_acquire(player->output)) {
++        free(headers);
++        lua_pop(L, 4);
++        return lua_audio_push_error(L, "audio player: output busy");
++    }
++    if (cap_tts_stream_begin(url, headers, body, timeout_ms) != ESP_OK) {
++        free(headers);
++        audio_device_release(player->output);
++        lua_pop(L, 4);
++        return lua_audio_push_error(L, "audio player: stream begin failed");
++    }
++    free(headers);
++    lua_pop(L, 4);
++
++    xSemaphoreTake(player->lock, portMAX_DELAY);
++    player->running = true;
++    player->current_uri_https = false;
++    player->state = ESP_ASP_STATE_NONE;
++    player->has_music_info = false;
++    player->converter_ready = false;
++    audio_converter_destroy(&player->converter);
++    xSemaphoreGive(player->lock);
++
++    uri = audio_strdup(AUDIO_STREAM_RAW_URI);
++    if (!uri) {
++        cap_tts_stream_end();
++        audio_device_release(player->output);
++        player->running = false;
++        return lua_audio_push_error(L, "audio player: out of memory");
++    }
++    ret = esp_audio_simple_player_run(player->asp, uri, NULL);
++    free(uri);
++    if (ret != ESP_GMF_ERR_OK) {
++        ESP_LOGE(TAG, "Player run stream failed: ret=%d", ret);
++        cap_tts_stream_end();
++        audio_device_release(player->output);
++        player->running = false;
++        return lua_audio_push_errorf(L, "audio player: play_stream failed (%d)", ret);
++    }
++    lua_pushboolean(L, 1);
++    return 1;
++}
++
+ int lua_audio_player_stop(lua_State *L)
+ {
+     audio_player_t *player = lua_audio_check_player(L, 1, "stop");
+     esp_gmf_err_t ret = esp_audio_simple_player_stop(player->asp);
++    cap_tts_stream_end();
+     if (ret != ESP_GMF_ERR_OK) {
+         ESP_LOGE(TAG, "Player stop failed: ret=%d", ret);
+         return lua_audio_push_errorf(L, "audio player: stop failed (%d)", ret);
+diff --git a/components/lua_modules/lua_module_audio/src/audio_private.h b/components/lua_modules/lua_module_audio/src/audio_private.h
+index 77aa693..181a8f2 100644
+--- a/components/lua_modules/lua_module_audio/src/audio_private.h
++++ b/components/lua_modules/lua_module_audio/src/audio_private.h
+@@ -43,6 +43,7 @@
+ #define AUDIO_DEVICE_INPUT_META       "lua_audio_input"
+ #define AUDIO_DEVICE_OUTPUT_META      "lua_audio_output"
+ #define AUDIO_PLAYER_META             "lua_audio_player"
++#define AUDIO_STREAM_RAW_URI          "raw://tts/stream.mp3"
+ #define AUDIO_RECORDER_META           "lua_audio_recorder"
+ #define AUDIO_ANALYZER_META           "lua_audio_analyzer"
+ #define AUDIO_SPECTRUM_MIN_FFT        64
+@@ -169,6 +170,7 @@ int lua_audio_player_new(lua_State *L);
+ int lua_audio_player_close(lua_State *L);
+ int lua_audio_player_gc(lua_State *L);
+ int lua_audio_player_play(lua_State *L);
++int lua_audio_player_play_stream(lua_State *L);
+ int lua_audio_player_stop(lua_State *L);
+ int lua_audio_player_pause(lua_State *L);
+ int lua_audio_player_resume(lua_State *L);
+diff --git a/components/lua_modules/lua_module_audio/src/lua_module_audio.c b/components/lua_modules/lua_module_audio/src/lua_module_audio.c
+index 1a45961..c17eca9 100644
+--- a/components/lua_modules/lua_module_audio/src/lua_module_audio.c
++++ b/components/lua_modules/lua_module_audio/src/lua_module_audio.c
+@@ -40,12 +40,13 @@ int luaopen_audio(lua_State *L)
+         {NULL, NULL},
+     };
+     static const luaL_Reg player_methods[] = {
+-        {"close",  lua_audio_player_close},
+-        {"play",   lua_audio_player_play},
+-        {"stop",   lua_audio_player_stop},
+-        {"pause",  lua_audio_player_pause},
+-        {"resume", lua_audio_player_resume},
+-        {"poll",   lua_audio_player_poll},
++        {"close",       lua_audio_player_close},
++        {"play",        lua_audio_player_play},
++        {"play_stream", lua_audio_player_play_stream},
++        {"stop",        lua_audio_player_stop},
++        {"pause",       lua_audio_player_pause},
++        {"resume",      lua_audio_player_resume},
++        {"poll",        lua_audio_player_poll},
+         {NULL, NULL},
+     };
+     static const luaL_Reg recorder_methods[] = {

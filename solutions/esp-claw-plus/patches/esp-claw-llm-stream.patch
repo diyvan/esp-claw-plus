@@ -1,0 +1,751 @@
+diff --git a/components/claw_modules/claw_core/include/claw_core.h b/components/claw_modules/claw_core/include/claw_core.h
+index 805e8b0..15bbd4b 100644
+--- a/components/claw_modules/claw_core/include/claw_core.h
++++ b/components/claw_modules/claw_core/include/claw_core.h
+@@ -40,6 +40,9 @@ typedef enum {
+ #define CLAW_CORE_REQUEST_FLAG_SKIP_RESPONSE_QUEUE (1U << 1)
+ #define CLAW_CORE_REQUEST_FLAG_USER_INTERRUPT      (1U << 2)
+ #define CLAW_CORE_REQUEST_FLAG_PUBLISH_STAGE_MESSAGE  (1U << 3)
++/* Stream incremental assistant text to the on-device voice sink so TTS can
++ * start before the LLM finishes the whole reply. Only set for voice turns. */
++#define CLAW_CORE_REQUEST_FLAG_STREAM_REPLY        (1U << 4)
+ 
+ #define CLAW_CORE_CONTEXT_PROVIDER_FLAG_REQUEST_START_ONLY (1U << 0)
+ 
+diff --git a/components/claw_modules/claw_core/src/claw_core_agent_loop.c b/components/claw_modules/claw_core/src/claw_core_agent_loop.c
+index d9e7d66..650cbfc 100644
+--- a/components/claw_modules/claw_core/src/claw_core_agent_loop.c
++++ b/components/claw_modules/claw_core/src/claw_core_agent_loop.c
+@@ -7,14 +7,86 @@
+ #include "claw_task.h"
+ 
+ #include <inttypes.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #include "esp_log.h"
+ #include "llm/claw_llm_http_transport.h"
+ 
+ static const char *TAG = "claw_core";
+ 
++/* -------------------------------------------------------------------------
++ * Voice streaming sink
++ *
++ * For voice turns the router sets CLAW_CORE_REQUEST_FLAG_STREAM_REPLY. The LLM
++ * backend then streams incremental assistant text through on_delta; we append
++ * it to a small FATFS file that the resident voice_ptt.lua consumer polls, so
++ * TTS can start before the whole reply is ready. The file is truncated at
++ * request start and terminated with an end marker at request end.
++ * ------------------------------------------------------------------------- */
++#define CLAW_CORE_STREAM_SINK_PATH "/fatfs/voice_stream.txt"
++#define CLAW_CORE_STREAM_SINK_FLUSH_BYTES 12
++#define CLAW_CORE_STREAM_SINK_END_MARKER "\x01\x01" "END" "\x01\x01"
++
++typedef struct {
++    FILE *fp;
++    size_t pending;
++    bool emitted;
++} claw_core_stream_sink_t;
++
++static void claw_core_stream_sink_open(claw_core_stream_sink_t *sink)
++{
++    if (!sink) {
++        return;
++    }
++    sink->fp = fopen(CLAW_CORE_STREAM_SINK_PATH, "wb");
++    sink->pending = 0;
++    sink->emitted = false;
++    if (!sink->fp) {
++        ESP_LOGW(TAG, "voice stream sink open failed: %s", CLAW_CORE_STREAM_SINK_PATH);
++        return;
++    }
++    fflush(sink->fp);
++    fsync(fileno(sink->fp));
++}
++
++static void claw_core_stream_sink_delta(const char *text_delta, void *user_ctx)
++{
++    claw_core_stream_sink_t *sink = (claw_core_stream_sink_t *)user_ctx;
++    size_t len;
++
++    if (!sink || !sink->fp || !text_delta) {
++        return;
++    }
++    len = strlen(text_delta);
++    if (len == 0 || fwrite(text_delta, 1, len, sink->fp) != len) {
++        return;
++    }
++    sink->emitted = true;
++    sink->pending += len;
++    if (sink->pending >= CLAW_CORE_STREAM_SINK_FLUSH_BYTES) {
++        fflush(sink->fp);
++        fsync(fileno(sink->fp));
++        sink->pending = 0;
++    }
++}
++
++static void claw_core_stream_sink_close(claw_core_stream_sink_t *sink)
++{
++    static const char end_marker[] = CLAW_CORE_STREAM_SINK_END_MARKER;
++
++    if (!sink || !sink->fp) {
++        return;
++    }
++    fwrite(end_marker, 1, sizeof(end_marker) - 1, sink->fp);
++    fflush(sink->fp);
++    fsync(fileno(sink->fp));
++    fclose(sink->fp);
++    sink->fp = NULL;
++}
++
+ static esp_err_t handle_pending_user_interrupts(claw_core_state_t *core,
+                                                 const claw_core_request_item_t *request,
+                                                 const char *timing_point,
+@@ -117,6 +189,7 @@ void claw_core_agent_loop_task(void *arg)
+         char obs_tool_calls_csv[CLAW_CORE_OBS_CSV_MAX] = {0};
+         bool original_user_persisted = false;
+         bool inject_active_user = true;
++        claw_core_stream_sink_t stream_sink = {0};
+ 
+         if (xQueueReceive(core->request_queue, &request, portMAX_DELAY) != pdTRUE) {
+             continue;
+@@ -238,6 +311,10 @@ void claw_core_agent_loop_task(void *arg)
+             inject_active_user = false;
+         }
+ 
++        if (request.view.flags & CLAW_CORE_REQUEST_FLAG_STREAM_REPLY) {
++            claw_core_stream_sink_open(&stream_sink);
++        }
++
+         while (true) {
+             claw_core_llm_response_free(&llm_response);
+             free(system_prompt);
+@@ -305,6 +382,8 @@ void claw_core_agent_loop_task(void *arg)
+                                               system_prompt,
+                                               messages,
+                                               tools_json,
++                                              stream_sink.fp ? claw_core_stream_sink_delta : NULL,
++                                              stream_sink.fp ? &stream_sink : NULL,
+                                               &llm_response,
+                                               &response.view.error_message);
+             if (err != ESP_OK) {
+@@ -445,6 +524,7 @@ void claw_core_agent_loop_task(void *arg)
+         }
+ 
+ finish_request:
++        claw_core_stream_sink_close(&stream_sink);
+         claw_core_control_set_phase(core, CLAW_CORE_AGENT_LOOP_PHASE_FINALIZING);
+         if (xSemaphoreTake(core->inflight_lock, portMAX_DELAY) == pdTRUE) {
+             bool was_cancelled = core->inflight_abort &&
+@@ -489,7 +569,15 @@ finish_request:
+                 }
+             }
+         }
+-        claw_core_publish_out_message_if_requested(&request, &response);
++        if (stream_sink.emitted) {
++            /* Reply was streamed to the voice sink; the resident consumer plays
++             * it. Suppress the final out_message so voice_reply.lua does not
++             * replay the whole text. */
++            ESP_LOGI(TAG, "request=%" PRIu32 " reply streamed; skipping out_message publish",
++                     request.view.request_id);
++        } else {
++            claw_core_publish_out_message_if_requested(&request, &response);
++        }
+         if (request.view.flags & CLAW_CORE_REQUEST_FLAG_SKIP_RESPONSE_QUEUE) {
+             claw_core_free_response_item(&response);
+         } else if (claw_core_response_push(core, &response) != ESP_OK) {
+diff --git a/components/claw_modules/claw_core/src/claw_core_llm.c b/components/claw_modules/claw_core/src/claw_core_llm.c
+index 59ddbaa..4c7f41c 100644
+--- a/components/claw_modules/claw_core/src/claw_core_llm.c
++++ b/components/claw_modules/claw_core/src/claw_core_llm.c
+@@ -181,6 +181,8 @@ esp_err_t claw_core_llm_chat_messages(claw_core_handle_t core,
+                                       const char *system_prompt,
+                                       cJSON *messages,
+                                       const char *tools_json,
++                                      claw_llm_delta_fn on_delta,
++                                      void *on_delta_user_ctx,
+                                       claw_core_llm_response_t *out_response,
+                                       char **out_error_message)
+ {
+@@ -204,6 +206,8 @@ esp_err_t claw_core_llm_chat_messages(claw_core_handle_t core,
+     request.messages = messages;
+     request.tools_json = tools_json;
+     request.abort_flag = &core->inflight_abort;
++    request.on_delta = on_delta;
++    request.on_delta_user_ctx = on_delta_user_ctx;
+ 
+ #if CLAW_CORE_LOG_FULL_LLM_REQUEST
+     messages_json = cJSON_PrintUnformatted(messages);
+diff --git a/components/claw_modules/claw_core/src/claw_core_llm.h b/components/claw_modules/claw_core/src/claw_core_llm.h
+index ea36baa..9263699 100644
+--- a/components/claw_modules/claw_core/src/claw_core_llm.h
++++ b/components/claw_modules/claw_core/src/claw_core_llm.h
+@@ -33,6 +33,8 @@ esp_err_t claw_core_llm_chat_messages(claw_core_handle_t core,
+                                       const char *system_prompt,
+                                       cJSON *messages,
+                                       const char *tools_json,
++                                      claw_llm_delta_fn on_delta,
++                                      void *on_delta_user_ctx,
+                                       claw_core_llm_response_t *out_response,
+                                       char **out_error_message);
+ esp_err_t claw_core_llm_infer_media(claw_core_handle_t core,
+diff --git a/components/claw_modules/claw_core/src/llm/backends/claw_llm_backend_openai_compatible.c b/components/claw_modules/claw_core/src/llm/backends/claw_llm_backend_openai_compatible.c
+index eb7bed3..f96cf1c 100644
+--- a/components/claw_modules/claw_core/src/llm/backends/claw_llm_backend_openai_compatible.c
++++ b/components/claw_modules/claw_core/src/llm/backends/claw_llm_backend_openai_compatible.c
+@@ -209,6 +209,7 @@ static esp_err_t parse_chat_response(const char *body,
+ static esp_err_t build_chat_body(const openai_compatible_backend_ctx_t *ctx,
+                                  const claw_llm_model_profile_t *profile,
+                                  const claw_llm_chat_request_t *request,
++                                 bool stream,
+                                  char **out_post_data,
+                                  char **out_error_message)
+ {
+@@ -231,6 +232,9 @@ static esp_err_t build_chat_body(const openai_compatible_backend_ctx_t *ctx,
+ 
+     cJSON_AddStringToObject(body, "model", ctx->model);
+     cJSON_AddNumberToObject(body, profile->max_tokens_field, ctx->max_tokens);
++    if (stream) {
++        cJSON_AddBoolToObject(body, "stream", true);
++    }
+ 
+     cJSON_AddStringToObject(system_msg, "role", "system");
+     cJSON_AddStringToObject(system_msg, "content", request->system_prompt);
+@@ -279,6 +283,356 @@ static esp_err_t build_chat_body(const openai_compatible_backend_ctx_t *ctx,
+     return ESP_OK;
+ }
+ 
++/* ------------------------------------------------------------------------- */
++/* Streaming (SSE) support                                                    */
++/* ------------------------------------------------------------------------- */
++
++typedef struct {
++    char *id;
++    char *name;
++    char *arguments;
++} stream_tool_call_t;
++
++typedef struct {
++    const claw_llm_chat_request_t *request;
++    char *text;
++    size_t text_len;
++    size_t text_cap;
++    char *reasoning;
++    size_t reasoning_len;
++    size_t reasoning_cap;
++    stream_tool_call_t *tool_calls;
++    size_t tool_call_count;
++    size_t tool_call_cap;
++    bool saw_delta;
++    bool tool_call_seen;
++} openai_stream_state_t;
++
++static esp_err_t stream_text_append(char **buf, size_t *len, size_t *cap, const char *frag)
++{
++    size_t frag_len;
++
++    if (!frag || !frag[0]) {
++        return ESP_OK;
++    }
++    frag_len = strlen(frag);
++    if (*len + frag_len + 1 > *cap) {
++        size_t new_cap = (*cap == 0) ? 256 : *cap;
++        char *grown;
++
++        while (*len + frag_len + 1 > new_cap) {
++            new_cap *= 2;
++        }
++        grown = realloc(*buf, new_cap);
++        if (!grown) {
++            return ESP_ERR_NO_MEM;
++        }
++        *buf = grown;
++        *cap = new_cap;
++    }
++    memcpy(*buf + *len, frag, frag_len);
++    *len += frag_len;
++    (*buf)[*len] = '\0';
++    return ESP_OK;
++}
++
++static stream_tool_call_t *stream_tool_call_slot(openai_stream_state_t *state, int index)
++{
++    if (index < 0) {
++        return NULL;
++    }
++    if ((size_t)index >= state->tool_call_cap) {
++        size_t new_cap = state->tool_call_cap ? state->tool_call_cap : 4;
++        stream_tool_call_t *grown;
++
++        while (new_cap <= (size_t)index) {
++            new_cap *= 2;
++        }
++        grown = realloc(state->tool_calls, new_cap * sizeof(*grown));
++        if (!grown) {
++            return NULL;
++        }
++        memset(grown + state->tool_call_cap, 0,
++               (new_cap - state->tool_call_cap) * sizeof(*grown));
++        state->tool_calls = grown;
++        state->tool_call_cap = new_cap;
++    }
++    if ((size_t)index + 1 > state->tool_call_count) {
++        state->tool_call_count = (size_t)index + 1;
++    }
++    return &state->tool_calls[index];
++}
++
++static esp_err_t stream_tool_string_append(char **dst, const char *frag)
++{
++    size_t old_len;
++    size_t frag_len;
++    char *grown;
++
++    if (!frag || !frag[0]) {
++        return ESP_OK;
++    }
++    old_len = *dst ? strlen(*dst) : 0;
++    frag_len = strlen(frag);
++    grown = realloc(*dst, old_len + frag_len + 1);
++    if (!grown) {
++        return ESP_ERR_NO_MEM;
++    }
++    memcpy(grown + old_len, frag, frag_len);
++    grown[old_len + frag_len] = '\0';
++    *dst = grown;
++    return ESP_OK;
++}
++
++static void openai_stream_on_sse(const char *data, size_t len, void *user_ctx)
++{
++    openai_stream_state_t *state = (openai_stream_state_t *)user_ctx;
++    cJSON *root;
++    cJSON *choices;
++    cJSON *choice0;
++    cJSON *delta;
++    cJSON *content;
++    cJSON *reasoning;
++    cJSON *tool_calls;
++
++    (void)len;
++    if (!state || !data || !data[0]) {
++        return;
++    }
++    if (strcmp(data, "[DONE]") == 0) {
++        return;
++    }
++
++    root = cJSON_Parse(data);
++    if (!root) {
++        return;
++    }
++    choices = cJSON_GetObjectItem(root, "choices");
++    choice0 = (choices && cJSON_IsArray(choices)) ? cJSON_GetArrayItem(choices, 0) : NULL;
++    delta = choice0 ? cJSON_GetObjectItem(choice0, "delta") : NULL;
++    if (!delta || !cJSON_IsObject(delta)) {
++        cJSON_Delete(root);
++        return;
++    }
++
++    state->saw_delta = true;
++
++    content = cJSON_GetObjectItem(delta, "content");
++    if (content && cJSON_IsString(content) && content->valuestring && content->valuestring[0]) {
++        if (state->request && state->request->on_delta && !state->tool_call_seen) {
++            state->request->on_delta(content->valuestring, state->request->on_delta_user_ctx);
++        }
++        stream_text_append(&state->text, &state->text_len, &state->text_cap, content->valuestring);
++    }
++
++    reasoning = cJSON_GetObjectItem(delta, "reasoning_content");
++    if (reasoning && cJSON_IsString(reasoning) && reasoning->valuestring) {
++        stream_text_append(&state->reasoning, &state->reasoning_len, &state->reasoning_cap,
++                           reasoning->valuestring);
++    }
++
++    tool_calls = cJSON_GetObjectItem(delta, "tool_calls");
++    if (tool_calls && cJSON_IsArray(tool_calls)) {
++        cJSON *tc;
++
++        cJSON_ArrayForEach(tc, tool_calls) {
++            cJSON *index_json = cJSON_GetObjectItem(tc, "index");
++            int index = (index_json && cJSON_IsNumber(index_json)) ? (int)index_json->valuedouble : 0;
++            stream_tool_call_t *slot = stream_tool_call_slot(state, index);
++            cJSON *id_json;
++            cJSON *fn;
++
++            if (!slot) {
++                continue;
++            }
++            state->tool_call_seen = true;
++
++            id_json = cJSON_GetObjectItem(tc, "id");
++            if (id_json && cJSON_IsString(id_json) && id_json->valuestring) {
++                stream_tool_string_append(&slot->id, id_json->valuestring);
++            }
++            fn = cJSON_GetObjectItem(tc, "function");
++            if (fn && cJSON_IsObject(fn)) {
++                cJSON *name_json = cJSON_GetObjectItem(fn, "name");
++                cJSON *args_json = cJSON_GetObjectItem(fn, "arguments");
++
++                if (name_json && cJSON_IsString(name_json) && name_json->valuestring) {
++                    stream_tool_string_append(&slot->name, name_json->valuestring);
++                }
++                if (args_json && cJSON_IsString(args_json) && args_json->valuestring) {
++                    stream_tool_string_append(&slot->arguments, args_json->valuestring);
++                }
++            }
++        }
++    }
++
++    cJSON_Delete(root);
++}
++
++static void openai_stream_state_free(openai_stream_state_t *state)
++{
++    size_t i;
++
++    if (!state) {
++        return;
++    }
++    free(state->text);
++    free(state->reasoning);
++    for (i = 0; i < state->tool_call_count; i++) {
++        free(state->tool_calls[i].id);
++        free(state->tool_calls[i].name);
++        free(state->tool_calls[i].arguments);
++    }
++    free(state->tool_calls);
++    memset(state, 0, sizeof(*state));
++}
++
++/* Rebuild a non-streaming shaped body from the accumulated deltas and reuse
++ * parse_chat_response() so validation/allocation logic stays identical. */
++static esp_err_t openai_stream_finalize(openai_stream_state_t *state,
++                                        claw_llm_response_t *out_response,
++                                        char **out_error_message)
++{
++    cJSON *root = cJSON_CreateObject();
++    cJSON *choices;
++    cJSON *choice;
++    cJSON *message;
++    char *body;
++    esp_err_t err;
++
++    if (!root) {
++        *out_error_message = dup_printf("Out of memory finalizing stream");
++        return ESP_ERR_NO_MEM;
++    }
++    choices = cJSON_CreateArray();
++    if (!choices) {
++        cJSON_Delete(root);
++        *out_error_message = dup_printf("Out of memory finalizing stream");
++        return ESP_ERR_NO_MEM;
++    }
++    cJSON_AddItemToObject(root, "choices", choices);
++
++    choice = cJSON_CreateObject();
++    if (!choice) {
++        cJSON_Delete(root);
++        *out_error_message = dup_printf("Out of memory finalizing stream");
++        return ESP_ERR_NO_MEM;
++    }
++    cJSON_AddItemToArray(choices, choice);
++
++    message = cJSON_CreateObject();
++    if (!message) {
++        cJSON_Delete(root);
++        *out_error_message = dup_printf("Out of memory finalizing stream");
++        return ESP_ERR_NO_MEM;
++    }
++    cJSON_AddItemToObject(choice, "message", message);
++
++    cJSON_AddStringToObject(message, "role", "assistant");
++    cJSON_AddStringToObject(message, "content", state->text ? state->text : "");
++    if (state->reasoning && state->reasoning[0]) {
++        cJSON_AddStringToObject(message, "reasoning_content", state->reasoning);
++    }
++
++    if (state->tool_call_count > 0) {
++        cJSON *tool_calls = cJSON_CreateArray();
++        size_t i;
++
++        if (!tool_calls) {
++            cJSON_Delete(root);
++            *out_error_message = dup_printf("Out of memory finalizing stream");
++            return ESP_ERR_NO_MEM;
++        }
++        cJSON_AddItemToObject(message, "tool_calls", tool_calls);
++
++        for (i = 0; i < state->tool_call_count; i++) {
++            cJSON *tc = cJSON_CreateObject();
++            cJSON *fn = cJSON_CreateObject();
++
++            if (!tc || !fn) {
++                cJSON_Delete(root);
++                *out_error_message = dup_printf("Out of memory finalizing stream");
++                return ESP_ERR_NO_MEM;
++            }
++            cJSON_AddStringToObject(tc, "id",
++                                    state->tool_calls[i].id ? state->tool_calls[i].id : "");
++            cJSON_AddStringToObject(tc, "type", "function");
++            cJSON_AddStringToObject(fn, "name",
++                                    state->tool_calls[i].name ? state->tool_calls[i].name : "");
++            cJSON_AddStringToObject(fn, "arguments",
++                                    state->tool_calls[i].arguments ? state->tool_calls[i].arguments : "");
++            cJSON_AddItemToObject(tc, "function", fn);
++            cJSON_AddItemToArray(tool_calls, tc);
++        }
++    }
++
++    body = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++    if (!body) {
++        *out_error_message = dup_printf("Out of memory serializing stream result");
++        return ESP_ERR_NO_MEM;
++    }
++
++    err = parse_chat_response(body, out_response, out_error_message);
++    free(body);
++    return err;
++}
++
++static esp_err_t openai_compatible_chat_stream(openai_compatible_backend_ctx_t *ctx,
++                                               const claw_llm_model_profile_t *profile,
++                                               const claw_llm_chat_request_t *request,
++                                               claw_llm_response_t *out_response,
++                                               char **out_error_message)
++{
++    claw_llm_http_json_request_t http_request = {0};
++    claw_llm_http_response_t http_response = {0};
++    openai_stream_state_t state = {0};
++    char *url = NULL;
++    char *post_data = NULL;
++    esp_err_t err;
++
++    err = build_chat_body(ctx, profile, request, true, &post_data, out_error_message);
++    if (err != ESP_OK) {
++        return err;
++    }
++
++    url = join_url(ctx->base_url, profile->chat_path);
++    if (!url) {
++        free(post_data);
++        *out_error_message = dup_printf("Out of memory building API URL");
++        return ESP_ERR_NO_MEM;
++    }
++
++    state.request = request;
++    http_request.url = url;
++    http_request.body = post_data;
++    http_request.api_key = ctx->api_key;
++    http_request.auth_type = ctx->auth_type;
++    http_request.timeout_ms = ctx->timeout_ms;
++    http_request.abort_flag = request->abort_flag;
++    http_request.on_sse_data = openai_stream_on_sse;
++    http_request.sse_data_user_ctx = &state;
++
++    err = claw_llm_http_post_json(&http_request, &http_response, out_error_message);
++    free(url);
++    free(post_data);
++    if (err != ESP_OK) {
++        openai_stream_state_free(&state);
++        return err;
++    }
++
++    if (!state.saw_delta) {
++        /* Server ignored stream:true and returned a plain JSON body. */
++        err = parse_chat_response(http_response.body, out_response, out_error_message);
++    } else {
++        err = openai_stream_finalize(&state, out_response, out_error_message);
++    }
++
++    claw_llm_http_response_free(&http_response);
++    openai_stream_state_free(&state);
++    return err;
++}
++
+ static esp_err_t openai_compatible_init(const claw_llm_runtime_config_t *config,
+                                         const claw_llm_model_profile_t *profile,
+                                         void **out_backend_ctx,
+@@ -352,7 +706,11 @@ static esp_err_t openai_compatible_chat(void *backend_ctx,
+         return ESP_ERR_INVALID_ARG;
+     }
+ 
+-    err = build_chat_body(ctx, profile, request, &post_data, out_error_message);
++    if (request->on_delta) {
++        return openai_compatible_chat_stream(ctx, profile, request, out_response, out_error_message);
++    }
++
++    err = build_chat_body(ctx, profile, request, false, &post_data, out_error_message);
+     if (err != ESP_OK) {
+         return err;
+     }
+diff --git a/components/claw_modules/claw_core/src/llm/claw_llm_http_transport.c b/components/claw_modules/claw_core/src/llm/claw_llm_http_transport.c
+index 2bfe16f..6d120ab 100644
+--- a/components/claw_modules/claw_core/src/llm/claw_llm_http_transport.c
++++ b/components/claw_modules/claw_core/src/llm/claw_llm_http_transport.c
+@@ -17,6 +17,7 @@
+ static const char *TAG = "llm_http";
+ 
+ #define CLAW_LLM_HTTP_RB_INITIAL_CAP 4096
++#define CLAW_LLM_HTTP_SSE_LINE_MAX 2048
+ 
+ typedef struct {
+     char *data;
+@@ -27,6 +28,10 @@ typedef struct {
+ typedef struct {
+     response_buffer_t *buffer;
+     volatile bool *abort_flag;
++    claw_llm_http_sse_fn on_sse_data;
++    void *sse_data_user_ctx;
++    char sse_line[CLAW_LLM_HTTP_SSE_LINE_MAX];
++    size_t sse_line_len;
+ } http_request_context_t;
+ 
+ static inline bool abort_requested(const http_request_context_t *ctx)
+@@ -180,6 +185,51 @@ static void response_buffer_free(response_buffer_t *buffer)
+     memset(buffer, 0, sizeof(*buffer));
+ }
+ 
++static void sse_flush_line(http_request_context_t *ctx)
++{
++    size_t len = ctx->sse_line_len;
++
++    ctx->sse_line_len = 0;
++    while (len > 0 && (ctx->sse_line[len - 1] == '\r' || ctx->sse_line[len - 1] == '\n')) {
++        len--;
++    }
++    ctx->sse_line[len] = '\0';
++
++    if (len < 5 || strncmp(ctx->sse_line, "data:", 5) != 0) {
++        return;
++    }
++    {
++        const char *payload = ctx->sse_line + 5;
++
++        while (*payload == ' ') {
++            payload++;
++        }
++        if (ctx->on_sse_data) {
++            ctx->on_sse_data(payload, strlen(payload), ctx->sse_data_user_ctx);
++        }
++    }
++}
++
++static void sse_feed(http_request_context_t *ctx, const char *data, size_t len)
++{
++    size_t i;
++
++    for (i = 0; i < len; i++) {
++        char c = data[i];
++
++        if (c == '\n') {
++            sse_flush_line(ctx);
++            continue;
++        }
++        if (ctx->sse_line_len < sizeof(ctx->sse_line) - 1) {
++            ctx->sse_line[ctx->sse_line_len++] = c;
++        } else {
++            /* Oversized line: drop it to keep the parser in sync. */
++            ctx->sse_line_len = 0;
++        }
++    }
++}
++
+ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+ {
+     http_request_context_t *ctx = (http_request_context_t *)evt->user_data;
+@@ -189,7 +239,18 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+     }
+ 
+     if (evt->event_id == HTTP_EVENT_ON_DATA) {
+-        return response_buffer_append(ctx->buffer, (const char *)evt->data, evt->data_len);
++        esp_err_t err = response_buffer_append(ctx->buffer, (const char *)evt->data, evt->data_len);
++
++        if (ctx->on_sse_data) {
++            sse_feed(ctx, (const char *)evt->data, evt->data_len);
++        }
++        return err;
++    }
++    if (evt->event_id == HTTP_EVENT_ON_FINISH) {
++        if (ctx->on_sse_data && ctx->sse_line_len > 0) {
++            sse_flush_line(ctx);
++        }
++        return ESP_OK;
+     }
+ 
+     return ESP_OK;
+@@ -296,6 +357,8 @@ esp_err_t claw_llm_http_post_json(const claw_llm_http_json_request_t *request,
+ 
+     request_ctx.buffer = &buffer;
+     request_ctx.abort_flag = request->abort_flag;
++    request_ctx.on_sse_data = request->on_sse_data;
++    request_ctx.sse_data_user_ctx = request->sse_data_user_ctx;
+     config.url = request->url;
+     config.event_handler = http_event_handler;
+     config.user_data = &request_ctx;
+diff --git a/components/claw_modules/claw_core/src/llm/claw_llm_types.h b/components/claw_modules/claw_core/src/llm/claw_llm_types.h
+index 2762875..09d14af 100644
+--- a/components/claw_modules/claw_core/src/llm/claw_llm_types.h
++++ b/components/claw_modules/claw_core/src/llm/claw_llm_types.h
+@@ -76,11 +76,18 @@ typedef struct {
+     size_t tool_call_count;
+ } claw_llm_response_t;
+ 
++/* Streaming callback: invoked with each incremental assistant text fragment as
++ * soon as it is parsed from the SSE stream. Optional; when NULL the backend
++ * falls back to a single blocking (non-streaming) request. */
++typedef void (*claw_llm_delta_fn)(const char *text_delta, void *user_ctx);
++
+ typedef struct {
+     const char *system_prompt;
+     cJSON *messages;
+     const char *tools_json;
+     volatile bool *abort_flag;
++    claw_llm_delta_fn on_delta;
++    void *on_delta_user_ctx;
+ } claw_llm_chat_request_t;
+ 
+ typedef struct {
+@@ -95,6 +102,11 @@ typedef struct {
+     const char *value;
+ } claw_llm_http_header_t;
+ 
++/* SSE callback: invoked once per complete `data:` line (prefix stripped) of a
++ * text/event-stream response. Optional; when NULL the transport keeps the body
++ * buffering behaviour unchanged. */
++typedef void (*claw_llm_http_sse_fn)(const char *data, size_t len, void *user_ctx);
++
+ typedef struct {
+     const char *url;
+     const char *body;
+@@ -104,6 +116,8 @@ typedef struct {
+     volatile bool *abort_flag;
+     const claw_llm_http_header_t *headers;
+     size_t header_count;
++    claw_llm_http_sse_fn on_sse_data;
++    void *sse_data_user_ctx;
+ } claw_llm_http_json_request_t;
+ 
+ typedef struct {
+diff --git a/components/claw_modules/claw_event_router/src/claw_event_router.c b/components/claw_modules/claw_event_router/src/claw_event_router.c
+index e648403..b938d6e 100644
+--- a/components/claw_modules/claw_event_router/src/claw_event_router.c
++++ b/components/claw_modules/claw_event_router/src/claw_event_router.c
+@@ -1792,6 +1792,13 @@ static esp_err_t claw_event_router_execute_agent_action(
+     agent_input.target_channel = (target_channel && target_channel[0]) ? target_channel : event->source_channel;
+     agent_input.target_chat_id = (target_chat_id && target_chat_id[0]) ? target_chat_id : event->chat_id;
+ 
++    /* Voice turns stream the assistant reply incrementally to the on-device
++     * voice sink so TTS can start before the LLM finishes. */
++    if ((agent_input.target_chat_id && strcmp(agent_input.target_chat_id, "voice") == 0) ||
++            (agent_input.source_chat_id && strcmp(agent_input.source_chat_id, "voice") == 0)) {
++        agent_input.flags |= CLAW_CORE_REQUEST_FLAG_STREAM_REPLY;
++    }
++
+     err = claw_agent_mgr_submit_root(&agent_input,
+                                      s_runtime->config.agent_submit_timeout_ms);
+ 

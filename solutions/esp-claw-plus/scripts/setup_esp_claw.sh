@@ -31,6 +31,9 @@ STACK_PATCH="$SOLUTION_DIR/patches/esp-claw-p4-task-stack-internal.patch"
 HA_VOICE_PATCH="$SOLUTION_DIR/patches/esp-claw-ha-voice-config.patch"
 HA_MCP_PATCH="$SOLUTION_DIR/patches/esp-claw-ha-mcp-token.patch"
 ASR_STREAM_PATCH="$SOLUTION_DIR/patches/esp-claw-asr-stream.patch"
+VOICE_LATENCY_PATCH="$SOLUTION_DIR/patches/esp-claw-voice-latency.patch"
+LLM_STREAM_PATCH="$SOLUTION_DIR/patches/esp-claw-llm-stream.patch"
+TTS_STREAM_PATCH="$SOLUTION_DIR/patches/esp-claw-tts-stream.patch"
 APP_OVERLAY="$SOLUTION_DIR/app/application/edge_agent/main"
 FS_OVERLAY="$SOLUTION_DIR/app/application/edge_agent/fatfs_image"
 UI_OVERLAY="$SOLUTION_DIR/app/application/edge_agent/components/http_server/frontend_source"
@@ -167,6 +170,38 @@ else
     exit 1
 fi
 echo "    注意: 新增 cap_asr_stream 组件后首次构建需先 idf.py reconfigure(idf_component.yml 缓存)"
+
+echo "==> 语音链路延迟优化 (voice 渠道提示词限长 + HTTP base64 字段流式解码下沉)"
+if git -C "$SRC_DIR" apply --check "$VOICE_LATENCY_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$VOICE_LATENCY_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$VOICE_LATENCY_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+
+echo "==> 语音链路延迟优化 (LLM 流式 SSE + voice 渠道 delta 落盘桥接)"
+if git -C "$SRC_DIR" apply --check "$LLM_STREAM_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$LLM_STREAM_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$LLM_STREAM_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+
+echo "==> 语音链路延迟优化 (TTS 真·边收边播: cap_tts_stream + audio.player raw:// 流式输入)"
+if git -C "$SRC_DIR" apply --check "$TTS_STREAM_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$TTS_STREAM_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$TTS_STREAM_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+echo "    注意: 新增 cap_tts_stream 组件后首次构建需先 idf.py reconfigure(idf_component.yml 缓存)"
+echo "    开关: 设备 /fatfs 下新建空文件 voice_tts_stream 启用边收边播, 删除即回退落盘合成"
 
 echo "==> 生成 board manager 配置"
 cd "$SRC_DIR/application/edge_agent"

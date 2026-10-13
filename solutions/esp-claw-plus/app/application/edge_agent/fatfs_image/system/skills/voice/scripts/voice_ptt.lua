@@ -22,6 +22,8 @@ local system = require("system")
 local ep = require("event_publisher")
 local json = require("json")
 local capability = require("capability")
+local tts = require("voice_tts")
+local vc = require("voice_common")
 
 local TAG = "[voice_ptt]"
 
@@ -49,7 +51,7 @@ local SILENT_RMS = 150                -- 整段录音峰值 RMS 低于此值视�
 
 -- 状态反馈: 失败原因同样写进 voice_status.txt 上屏, 但错误态只保留 STATUS_HOLD_MS,
 -- 到期由主循环自动回「空闲」, 避免面板状态行/指示灯一直卡在错误态。
-local STATUS_IDLE = "空闲"
+local STATUS_IDLE = "idle"
 local STATUS_HOLD_MS = 4000
 local REPLY_TIMEOUT_MS = 30000 -- 注入 Agent 后等待回复的上限, 超时提示「AI 无响应」
 local FINISH_TIMEOUT_MS = 6000 -- 流式 ASR: 收尾发末包后等待最终结果的上限
@@ -58,68 +60,66 @@ local FINISH_TIMEOUT_MS = 6000 -- 流式 ASR: 收尾发末包后等待最终结�
 local VOICE_CHANNEL = "voice"
 local VOICE_CHAT_ID = "voice"
 
--- 屏幕桥: ha_panel 轮询 /fatfs/voice_*.txt 把对话显示到 LVGL 面板上。
-local function write_bridge(name, content)
-    local ok, err = pcall(function()
-        storage.write_file(storage.join_path(storage.get_root_dir(), name), content)
-    end)
-    if not ok then
-        print(TAG .. " write " .. name .. " failed: " .. tostring(err))
-    end
-    return ok
-end
+-- 流式回复文件: C 侧 (claw_core_agent_loop.c) 在 voice 轮次把 LLM 增量文本追加到该文件,
+-- 结束时写入 STREAM_END_MARKER。本脚本按句切分逐句合成播报 (句子级流水线), 从而在 LLM
+-- 尚未生成完整回复前就开始 TTS。此种情况下 C 侧不再发布 out_message, voice_reply.lua
+-- 不会被触发, 播放由本脚本负责。
+local STREAM_FILE = "voice_stream.txt"
+local STREAM_END_MARKER = "\1\1" .. "END" .. "\1\1"
 
--- 状态反馈 (voice_status.txt -> 面板「状态:」行 + 串口日志)。
--- set_status: 流程态 (录音中/识别中/空闲), 保持到下次变化。
--- set_wait:   等待态 (思考中), 超过 timeout_ms 仍未被下一步推进 (voice_reply.lua 写新状态)
---             就改成 timeout_text, 让"识别成功但没人回复"也能看见。
--- set_error:  失败态 (录音太短/未录到声音/ASR HTTP 4xx/未识别到语音 ...), 保留
---             STATUS_HOLD_MS 后自动回「空闲」。
--- 到期改写的守卫: 只有当面板状态仍是本阶段写下的文本时才改写, 避免覆盖别的脚本
+-- 屏幕桥 (voice_status.txt / voice_user.txt / voice_agent.txt 的读写) 统一由 voice_common
+-- 承载, 见 SKILL.md「屏幕桥」一节。此处仅保留面板状态机逻辑。
+
+-- 状态反馈 (voice_status.txt -> 面板「状态:」行 + 串口日志)。状态一律写机器可读的 code
+-- (SKILL.md「状态码」), detail 只承载补充文本; 面板按 code 查表得到中文与指示灯, 不再靠
+-- 中文串比对。
+-- set_status: 流程态 (recording/recognizing/idle), 保持到下次变化。
+-- set_wait:   等待态 (thinking), 超过 timeout_ms 仍未被下一步推进 (voice_reply.lua 写新状态)
+--             就写成 error|timeout_reason, 让"识别成功但没人回复"也能看见。
+-- set_error:  失败态 (写 error|reason), 保留 STATUS_HOLD_MS 后自动回 idle。
+-- 到期改写的守卫: 只有当面板状态码仍是本阶段写下的 code 时才改写, 避免覆盖别的脚本
 -- (voice_reply.lua) 已推进的新状态。
-local status_until, status_next, status_guard = nil, nil, nil
+local status_until, status_next_code, status_next_detail, status_guard = nil, nil, nil, nil
 
-local function arm_status(deadline, next_text, guard)
-    status_until, status_next, status_guard = deadline, next_text, guard
+local function arm_status(deadline, next_code, next_detail, guard)
+    status_until, status_next_code, status_next_detail, status_guard = deadline, next_code, next_detail, guard
 end
 
-local function write_status(text)
-    write_bridge("voice_status.txt", text)
-    print(TAG .. " status -> " .. text)
+local function write_status(code, detail)
+    vc.set_status(code, detail)
+    local suffix = (detail and detail ~= "") and (" (" .. detail .. ")") or ""
+    print(TAG .. " status -> " .. code .. suffix)
 end
 
-local function set_status(text)
-    arm_status(nil, nil, nil)
-    write_status(text)
+local function set_status(code)
+    arm_status(nil, nil, nil, nil)
+    write_status(code)
 end
 
-local function set_wait(text, timeout_ms, timeout_text)
-    arm_status(system.millis() + timeout_ms, timeout_text, text)
-    write_status(text)
+local function set_wait(code, timeout_ms, timeout_reason)
+    arm_status(system.millis() + timeout_ms, "error", timeout_reason, code)
+    write_status(code)
 end
 
-local function set_error(text)
-    arm_status(system.millis() + STATUS_HOLD_MS, STATUS_IDLE, text)
-    write_status(text)
+local function set_error(reason)
+    arm_status(system.millis() + STATUS_HOLD_MS, STATUS_IDLE, nil, "error")
+    write_status("error", reason)
 end
 
 local function tick_status()
     if not status_until or system.millis() < status_until then
         return
     end
-    local next_text, guard = status_next, status_guard
-    arm_status(nil, nil, nil)
-    if guard then
-        local path = storage.join_path(storage.get_root_dir(), "voice_status.txt")
-        local ok, cur = pcall(storage.read_file, path)
-        if not (ok and type(cur) == "string" and cur == guard) then
-            return
-        end
+    local next_code, next_detail = status_next_code, status_next_detail
+    local guard = status_guard
+    arm_status(nil, nil, nil, nil)
+    if guard and vc.read_status_code() ~= guard then
+        return
     end
-    if next_text == STATUS_IDLE then
+    if next_code == STATUS_IDLE then
         write_status(STATUS_IDLE)
     else
-        set_error(next_text)
+        set_error(next_detail)
     end
 end
 
@@ -133,52 +133,28 @@ local function take_wake_trigger()
     return true
 end
 
--- 语音打断 (barge-in): 用户开始说话 (按下 BOOT 或唤醒) 时写标志文件,
--- 正在播放 TTS 的 voice_reply.lua 轮询到该标志即 player:stop()。跨脚本唯一可行
--- 的信道是文件 (/fatfs), 详见 voice_reply.lua。
-local INTERRUPT_FLAG = "voice_interrupt"
-local function signal_interrupt()
-    pcall(storage.write_file, storage.join_path(storage.get_root_dir(), INTERRUPT_FLAG), "")
+-- 语音打断 (barge-in): 用户开始说话 (按下 BOOT 或唤醒) 时调 vc.signal_interrupt() 写标志文件,
+-- 正在播放 TTS 的 voice_reply.lua 轮询到该标志即 player:stop()。跨脚本唯一可行的信道是
+-- 文件 (/fatfs), 由 voice_common 统一承载, 详见 voice_common.lua。
+
+-- [边收边播开关] 存储根目录存在该标记文件时, 每句回复以 TTS 流式边收边解码边播放
+-- (player:play_stream), 不再整句合成落盘。默认关闭 (零回归): 与 wake_trigger / voice_interrupt
+-- 一样用 /fatfs 文件做跨脚本开关, 在设备「文件」页新建一个空文件 voice_tts_stream 即启用。
+local STREAM_FLAG = "voice_tts_stream"
+
+local function stream_enabled()
+    return storage.exists(storage.join_path(storage.get_root_dir(), STREAM_FLAG))
 end
 
 -- ---------------------------------------------------------------------------
 -- 运行时配置桥: C 侧 (ha_panel.c) 把网页配置写入 /fatfs/ha_voice_runtime.json,
--- 本脚本读取其中的 ASR/TTS 端点与唤醒开关。缓存 1s, 避免每轮轮询都读文件。
+-- 本脚本经 vc.runtime_config() 读取其中的 ASR/TTS 端点与唤醒开关 (模块内缓存 1s)。
 -- 字段: voice_enabled / voice_wake_enabled / voice_asr_url / voice_asr_api_key /
 --       voice_asr_provider / voice_asr_resource_id /
 --       voice_tts_url / voice_tts_api_key / voice_tts_provider /
 --       voice_tts_resource_id / voice_tts_speaker / ha_enabled / ha_base_url / ha_token
 -- 说明: voice_enabled 是语音助手总开关, 关闭后 PTT 与唤醒词都停用。
 -- ---------------------------------------------------------------------------
-local RUNTIME_CONFIG = "ha_voice_runtime.json"
-local cfg_cache = {}
-local cfg_at = -100000
-
-local function load_runtime_config()
-    local path = storage.join_path(storage.get_root_dir(), RUNTIME_CONFIG)
-    if not storage.exists(path) then
-        return {}
-    end
-    local ok, content = pcall(storage.read_file, path)
-    if not ok or type(content) ~= "string" or content == "" then
-        return {}
-    end
-    local decode_ok, data = pcall(json.decode, content)
-    if not decode_ok or type(data) ~= "table" then
-        print(TAG .. " runtime config decode failed")
-        return {}
-    end
-    return data
-end
-
-local function runtime_config()
-    local now = system.millis()
-    if now - cfg_at >= 1000 then
-        cfg_cache = load_runtime_config()
-        cfg_at = now
-    end
-    return cfg_cache
-end
 
 -- 配置里的布尔值可能是 JSON 布尔 (true/false) 或字符串 ("true"/"false")。
 local function cfg_is_true(value, fallback)
@@ -190,7 +166,7 @@ end
 
 -- 语音助手总开关 (voice_enabled): 关闭后 PTT 与唤醒词都停用, 面板也会隐藏语音页。
 local function voice_assistant_enabled()
-    return cfg_is_true(runtime_config().voice_enabled, true)
+    return cfg_is_true(vc.runtime_config().voice_enabled, true)
 end
 
 -- 估算一小段 16-bit 小端交织 PCM 的 RMS (每 4 帧取 1 帧, 限制 CPU 开销)。
@@ -350,7 +326,7 @@ end
 -- 注意: cap_http_request 有主机白名单, 必须先把 ASR 域名加入「HTTP 白名单」
 --       (search_http_allowlist / NVS http_allow_ls)。
 local function asr_transcribe(wav_path, info)
-    local cfg = runtime_config()
+    local cfg = vc.runtime_config()
 
     -- 供应商分派: voice_asr_provider 为空 / "generic" 时走下方原有 generic 逻辑(保持不变);
     -- 其余值即 require("providers.asr_<provider>")。接入新云端只需新增 providers/asr_*.lua。
@@ -441,9 +417,256 @@ end
 -- ---------------------------------------------------------------------------
 -- PTT 状态机: idle <-> recording
 -- ---------------------------------------------------------------------------
-local state = "idle"          -- "idle" | "recording"
+local state = "idle"          -- "idle" | "recording" | "waiting"
 local release_requested = false
 local rec = nil               -- { input, info, chunks, bytes, start_ms }
+
+-- ---------------------------------------------------------------------------
+-- 句子级流式播报 (voice_stream.txt 消费端)
+--
+-- 注入用户文本后进入 "waiting": 轮询 /fatfs/voice_stream.txt, 每凑齐一句就同步合成 +
+-- 异步播放, 边生成边播报。若本轮没有流式内容 (C 侧回退或模型直接走非流式), 文件只含
+-- 结束标记 -> 交回 voice_reply.lua 的普通路径播放, 本脚本不重复播报。
+-- ---------------------------------------------------------------------------
+local WAIT_POLL_MS = 20            -- 等待态轮询间隔
+local SOFT_SPLIT_MAX = 40          -- 无强标点时超过此长度即在软标点处切句, 限制首句延迟
+local STRONG_TERM = {}             -- 强终止符: 命中立即断句
+for _, ch in ipairs({ "。", "！", "？", "!", "?", "；", ";", "\n" }) do
+    STRONG_TERM[ch] = true
+end
+local SOFT_TERM = { ["，"] = true, [","] = true, ["、"] = true, ["："] = true, [":"] = true }
+
+local reply_wait = nil             -- { consumed, buf, queue, ended, player, output, played, deadline, tts_cfg }
+
+local function stream_path()
+    return storage.join_path(storage.get_root_dir(), STREAM_FILE)
+end
+
+
+-- 读取流式文件: 返回 (可见文本, 是否已结束)。文本不含结束标记; 只出现控制字节 \1\1
+-- 也视为未写完的标记, 一并剔除。
+local function read_stream()
+    local path = stream_path()
+    if not storage.exists(path) then
+        return "", false
+    end
+    local ok, content = pcall(storage.read_file, path)
+    if not ok or type(content) ~= "string" then
+        return "", false
+    end
+    local p = content:find("\1\1", 1, true)
+    if p then
+        local tail = content:sub(p, p + #STREAM_END_MARKER - 1)
+        return content:sub(1, p - 1), tail == STREAM_END_MARKER
+    end
+    return content, false
+end
+
+local function trim(s)
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- 从缓冲取一句: 优先强终止符; 无强标点且已很长时在最后一个软标点处切; flush 时返回全部。
+local function next_sentence(buf, flush)
+    if buf == "" then
+        return nil, buf
+    end
+    for i = 1, #buf do
+        if STRONG_TERM[buf:sub(i, i)] then
+            return buf:sub(1, i), buf:sub(i + 1)
+        end
+    end
+    if #buf >= SOFT_SPLIT_MAX then
+        for i = #buf, 1, -1 do
+            if SOFT_TERM[buf:sub(i, i)] then
+                return buf:sub(1, i), buf:sub(i + 1)
+            end
+        end
+    end
+    if flush then
+        return buf, ""
+    end
+    return nil, buf
+end
+
+-- 边收边播一句: 向 provider 要流式请求描述, 交给 player:play_stream() 直接边收边解码边播放。
+-- 返回 true 表示已递交流式播放; false 表示不支持/失败, 调用方回退到落盘路径。
+local function play_sentence_stream(sentence)
+    local req = tts.stream_request(reply_wait.tts_cfg, sentence)
+    if not req then
+        return false
+    end
+    if not reply_wait.player then
+        reply_wait.player = audio.player({ output = reply_wait.output })
+    end
+    if not reply_wait.player then
+        return false
+    end
+    vc.clear_interrupt()
+    if reply_wait.player:play_stream(req) then
+        reply_wait.played = true
+        set_status("speaking")
+        return true
+    end
+    print(TAG .. " play_stream failed, fallback to file")
+    return false
+end
+
+-- 合成并异步播放一句 (按需创建 player)。
+local function play_sentence(sentence)
+    sentence = trim(sentence)
+    if sentence == "" or not reply_wait.output then
+        return
+    end
+    if reply_wait.stream_enabled and play_sentence_stream(sentence) then
+        return
+    end
+    local path = tts.synthesize(reply_wait.tts_cfg, sentence, "voice_reply", storage.get_root_dir())
+    if not path then
+        return
+    end
+    vc.clear_interrupt()
+    if not reply_wait.player then
+        reply_wait.player = audio.player({ output = reply_wait.output })
+    end
+    if reply_wait.player and reply_wait.player:play(path) then
+        reply_wait.played = true
+        set_status("speaking")
+    else
+        print(TAG .. " play failed: " .. path)
+    end
+end
+
+-- 停止播放并释放输出设备 (barge-in / 新录音前调用)。
+local function abort_reply_wait()
+    if not reply_wait then
+        return
+    end
+    if reply_wait.player then
+        pcall(function() reply_wait.player:stop() end)
+        pcall(function() reply_wait.player:close() end)
+    end
+    if reply_wait.output then
+        pcall(function() reply_wait.output:close() end)
+    end
+    reply_wait = nil
+end
+
+-- 正常收尾: 关闭播放器/输出, 回空闲。播报过才写「空闲」, 否则交给 voice_reply 维护状态。
+local function end_reply_wait()
+    if not reply_wait then
+        return
+    end
+    local played = reply_wait.played
+    if reply_wait.player then
+        pcall(function() reply_wait.player:close() end)
+    end
+    if reply_wait.output then
+        pcall(function() reply_wait.output:close() end)
+    end
+    reply_wait = nil
+    state = "idle"
+    if played then
+        set_status(STATUS_IDLE)
+    end
+end
+
+-- 注入前准备: 清掉上一轮流文件 (否则会读到上一轮残留), 建等待态并打开 DAC 输出。
+-- 会话记录不清: 助手回复由 log_agent_append 在切出首句时新建一条 A, 与历史共存。
+local function arm_reply_wait()
+    abort_reply_wait()
+    pcall(storage.remove, stream_path())
+
+    local wait = {
+        consumed = 0, buf = "", queue = {}, ended = false,
+        player = nil, output = nil, played = false,
+        stream_enabled = stream_enabled(),
+        deadline = system.millis() + REPLY_TIMEOUT_MS,
+        tts_cfg = vc.runtime_config(),
+    }
+
+    local codec, rate, channels, bits = bm.get_audio_codec_output_params("audio_dac")
+    if codec then
+        wait.output = audio.new_output({ codec, rate, channels, bits, volume = 80 })
+    end
+    if wait.output then
+        wait.player = audio.player({ output = wait.output })
+        if not wait.player then
+            wait.output:close()
+            wait.output = nil
+        end
+    end
+    if not wait.player then
+        print(TAG .. " reply wait: audio output unavailable, stream playback disabled")
+    end
+    reply_wait = wait
+end
+
+local function start_reply_wait()
+    if reply_wait then
+        reply_wait.deadline = system.millis() + REPLY_TIMEOUT_MS
+    end
+    state = "waiting"
+end
+
+-- 等待态主步骤: 推进播放 -> 读流文件切句 -> 起播下一句 -> 结束/超时/打断判定。
+local function wait_step()
+    tick_status()
+
+    local player_running = false
+    if reply_wait.player then
+        local st = reply_wait.player:poll()
+        player_running = (st and st.running) and true or false
+        if not player_running then
+            reply_wait.player:close()
+            reply_wait.player = nil
+        elseif vc.interrupt_requested() then
+            print(TAG .. " barge-in during stream playback -> stop")
+            vc.clear_interrupt()
+            abort_reply_wait()
+            state = "idle"
+            return
+        end
+    end
+
+    if not reply_wait.ended then
+        local text, ended = read_stream()
+        if #text > reply_wait.consumed then
+            reply_wait.buf = reply_wait.buf .. text:sub(reply_wait.consumed + 1)
+            reply_wait.consumed = #text
+        end
+        local sentence
+        repeat
+            sentence, reply_wait.buf = next_sentence(reply_wait.buf, ended)
+            if sentence then
+                vc.log_agent_append(sentence)
+                reply_wait.queue[#reply_wait.queue + 1] = sentence
+            end
+        until not sentence
+        if ended then
+            reply_wait.ended = true
+        end
+    end
+
+    -- 流式模式下一句必须等上一句播完 (cap_tts_stream 为单会话, 会打断在途音频)。
+    if #reply_wait.queue > 0 and not (reply_wait.stream_enabled and player_running) then
+        play_sentence(table.remove(reply_wait.queue, 1))
+    end
+
+    if reply_wait.ended and not reply_wait.player and #reply_wait.queue == 0 then
+        end_reply_wait()
+        return
+    end
+
+    if system.millis() > reply_wait.deadline then
+        print(TAG .. " reply wait timed out")
+        abort_reply_wait()
+        state = "idle"
+        return
+    end
+
+    delay.delay_ms(WAIT_POLL_MS)
+end
 
 -- 收尾: 关闭设备, 落盘 wav, 走 ASR 并注入 Agent。
 -- 每个失败分支都把原因经 set_error() 反馈到面板状态行 (不再静默回到「空闲」) 并打串口日志。
@@ -486,15 +709,17 @@ local function finish_recording(ok, reason)
     if session then
         print(string.format("%s streamed %dms %dHz/%dch/%dbit bytes=%d peak_rms=%.0f",
                             TAG, elapsed, info.sample_rate, info.channels, info.bits, data_bytes, peak_rms))
-        set_status("识别中")
+        set_status("recognizing")
         local text, err = session:finish(FINISH_TIMEOUT_MS)
         if (not text or text == "") and stream_err then
             err = stream_err
         end
         if text and text ~= "" then
-            write_bridge("voice_user.txt", text)
-            set_wait("思考中", REPLY_TIMEOUT_MS, "AI 无响应")
+            vc.log_user(text)
+            set_wait("thinking", REPLY_TIMEOUT_MS, "AI 无响应")
+            arm_reply_wait()
             inject_text(text)
+            start_reply_wait()
         else
             set_error(err or "识别失败")
         end
@@ -506,7 +731,9 @@ local function finish_recording(ok, reason)
     for i = 1, #chunks do
         out[i + 1] = chunks[i]
     end
-    if not write_bridge("voice_ptt.wav", table.concat(out)) then
+    local wav_path = storage.join_path(storage.get_root_dir(), "voice_ptt.wav")
+    local wav_ok = pcall(storage.write_file, wav_path, table.concat(out))
+    if not wav_ok then
         set_error("录音写盘失败")
         return
     end
@@ -514,12 +741,14 @@ local function finish_recording(ok, reason)
     print(string.format("%s recorded %dms %dHz/%dch/%dbit bytes=%d peak_rms=%.0f",
                         TAG, elapsed, info.sample_rate, info.channels, info.bits, data_bytes, peak_rms))
 
-    set_status("识别中")
+    set_status("recognizing")
     local text, err = asr_transcribe(storage.join_path(storage.get_root_dir(), "voice_ptt.wav"), info)
     if text and text ~= "" then
-        write_bridge("voice_user.txt", text)
-        set_wait("思考中", REPLY_TIMEOUT_MS, "AI 无响应")
+        vc.log_user(text)
+        set_wait("thinking", REPLY_TIMEOUT_MS, "AI 无响应")
+        arm_reply_wait()
         inject_text(text)
+        start_reply_wait()
     else
         set_error(err or "识别失败")
     end
@@ -560,7 +789,7 @@ local function record_step()
         end
         if text and text ~= "" and text ~= rec.stream_text then
             rec.stream_text = text
-            write_bridge("voice_user.txt", text)
+            vc.log_user(text)
         end
     else
         rec.chunks[#rec.chunks + 1] = chunk
@@ -601,6 +830,9 @@ end
 
 -- mode: "ptt" (按键) | "auto" (唤醒词触发)
 local function start_recording(mode)
+    -- 新一轮录音前先拆掉上一轮的流式播报 (停播 + 释放扬声器)。
+    abort_reply_wait()
+
     local codec, rate, channels, bits = bm.get_audio_codec_input_params("audio_adc")
     if not codec then
         print(TAG .. " get_audio_codec_input_params(audio_adc) failed")
@@ -647,7 +879,7 @@ local function start_recording(mode)
 
     -- 流式 ASR: provider 导出 open() 时先开一条会话, 之后 record_step 边录边发。
     -- (provider 为空 / generic 时保持原有批量路径, 此处不做任何事。)
-    local cfg = runtime_config()
+    local cfg = vc.runtime_config()
     local provider = cfg.voice_asr_provider or ""
     if provider ~= "" and provider ~= "generic" then
         local ok, mod = pcall(require, "providers.asr_" .. provider)
@@ -667,7 +899,7 @@ local function start_recording(mode)
 
     state = "recording"
 
-    set_status("录音中")
+    set_status("recording")
     print(string.format("%s %s start: %dHz/%dch/%dbit (bpf=%s)%s",
                         TAG, mode, info.sample_rate, info.channels, info.bits,
                         tostring(info.bytes_per_frame), rec.session and " [stream]" or ""))
@@ -685,7 +917,7 @@ local function on_press_down(evt)
     -- 丢弃可能残留的唤醒触发, 避免按键结束后又被自动录音再触发一次。
     take_wake_trigger()
     -- 立即打断正在播放的 TTS (barge-in)。
-    signal_interrupt()
+    vc.signal_interrupt()
     start_recording("ptt")
 end
 
@@ -725,7 +957,7 @@ local function consume_wake_trigger()
         print(TAG .. " voice assistant disabled by config -> trigger ignored")
         return false
     end
-    if not cfg_is_true(runtime_config().voice_wake_enabled, true) then
+    if not cfg_is_true(vc.runtime_config().voice_wake_enabled, true) then
         print(TAG .. " wake word disabled by config -> trigger ignored")
         return false
     end
@@ -738,8 +970,11 @@ while true do
         record_step()
     elseif consume_wake_trigger() then
         print(TAG .. " wake trigger detected -> auto record")
-        signal_interrupt()
+        vc.signal_interrupt()
         start_recording("auto")
+    elseif state == "waiting" then
+        -- 等待/播报流式回复: 轮询 voice_stream.txt 逐句播报。
+        wait_step()
     else
         -- 空闲时把到期的错误状态恢复成「空闲」, 然后按轮询间隔休眠。
         tick_status()
