@@ -1,0 +1,893 @@
+diff --git a/components/claw_capabilities/cap_asr_stream/CMakeLists.txt b/components/claw_capabilities/cap_asr_stream/CMakeLists.txt
+new file mode 100644
+index 0000000..4589068
+--- /dev/null
++++ b/components/claw_capabilities/cap_asr_stream/CMakeLists.txt
+@@ -0,0 +1,13 @@
++idf_component_register(
++    SRCS
++        "src/cap_asr_stream.c"
++    INCLUDE_DIRS
++        "include"
++    REQUIRES
++        claw_cap
++        esp_websocket_client
++        esp_event
++        freertos
++        mbedtls
++        cjson
++)
+diff --git a/components/claw_capabilities/cap_asr_stream/idf_component.yml b/components/claw_capabilities/cap_asr_stream/idf_component.yml
+new file mode 100644
+index 0000000..c093387
+--- /dev/null
++++ b/components/claw_capabilities/cap_asr_stream/idf_component.yml
+@@ -0,0 +1 @@
++dependencies: {}
+diff --git a/components/claw_capabilities/cap_asr_stream/include/cap_asr_stream.h b/components/claw_capabilities/cap_asr_stream/include/cap_asr_stream.h
+new file mode 100644
+index 0000000..ba6df23
+--- /dev/null
++++ b/components/claw_capabilities/cap_asr_stream/include/cap_asr_stream.h
+@@ -0,0 +1,18 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#pragma once
++
++#include "esp_err.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++esp_err_t cap_asr_stream_register_group(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/components/claw_capabilities/cap_asr_stream/src/cap_asr_stream.c b/components/claw_capabilities/cap_asr_stream/src/cap_asr_stream.c
+new file mode 100644
+index 0000000..4d9b6ba
+--- /dev/null
++++ b/components/claw_capabilities/cap_asr_stream/src/cap_asr_stream.c
+@@ -0,0 +1,752 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * cap_asr_stream —— 流式语音识别会话 (WebSocket + 火山引擎 sauc 二进制协议)。
++ *
++ * 与 cap_http_request 的"一次调用一次结果"不同, 本 cap 维护一个跨多次调用存活的
++ * 会话: Lua 侧按 action 驱动状态机 (start -> audio* -> [poll*] -> finish|abort)。
++ * execute 是同步的, 但内部所有网络收发都在 esp_websocket_client 的独立 task 上,
++ * 故各 action 均快速返回, 不阻塞 Lua 主循环 (语音采集循环约每 60ms 调一次)。
++ *
++ * 协议要点 (官方《大模型流式语音识别API》):
++ *   4 字节头: [version=1|header_size=1][message_type|flags][serialization|compression][reserved]
++ *   整数一律大端。client->server: full client request(0x1) + audio only request(0x2);
++ *   server->client: full server response(0x9) / error(0xF)。
++ *   compression 采用 0b0000 (不压缩): 服务端沿用客户端的压缩方式, 故响应同样不压缩,
++ *   从而无需在设备侧引入 deflate/ inflate 实现。
++ *
++ * 输入 JSON (由 Lua 侧 capability.call 传入):
++ *   start : {"action":"start","url":"wss://...","headers":"K: V\r\n...","payload_json":"{...}"}
++ *   audio : {"action":"audio","pcm":"<base64 pcm>"}
++ *   poll  : {"action":"poll"}
++ *   finish: {"action":"finish","timeout_ms":5000}
++ *   abort : {"action":"abort"}
++ * 输出为纯文本, 首行是状态码:
++ *   OK                 —— start/audio/abort 成功
++ *   TEXT\n<文本>       —— poll, <文本> 为当前累计识别结果 (可能为空)
++ *   FINAL\n<文本>      —— finish, <文本> 为最终识别结果
++ *   ERR\n<原因>        —— 失败原因 (中文, 供面板直接展示)
++ */
++#include "cap_asr_stream.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "cJSON.h"
++#include "claw_cap.h"
++#include "esp_crt_bundle.h"
++#include "esp_log.h"
++#include "esp_websocket_client.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/semphr.h"
++#include "mbedtls/base64.h"
++
++static const char *TAG = "cap_asr_stream";
++
++#define ASR_TEXT_MAX     4096
++#define ASR_ERR_MAX      192
++#define ASR_RX_BUF       (16 * 1024)
++#define ASR_PEND_MAX     (256 * 1024)
++#define ASR_WS_STACK     (8 * 1024)
++
++/* 协议常量: 见文件头说明 */
++#define PROTO_VER_HDR    0x11   /* (version=1 << 4) | header_size=1 */
++#define MT_FULL_CLIENT   0x1
++#define MT_AUDIO_ONLY    0x2
++#define MT_FULL_SERVER   0x9
++#define MT_SERVER_ERR    0xF
++#define FL_NONE          0x0
++#define FL_SEQ_POS       0x1
++#define FL_LAST_NO_SEQ   0x2
++#define FL_LAST_NEG_SEQ  0x3
++#define SER_NONE         0x0
++#define SER_JSON         0x1
++#define COMP_NONE        0x0
++
++typedef struct asr_pending {
++    struct asr_pending *next;
++    uint8_t *frame;
++    size_t len;
++} asr_pending_t;
++
++typedef struct {
++    esp_websocket_client_handle_t client;
++    SemaphoreHandle_t lock;
++    SemaphoreHandle_t final_evt;
++    bool connected;
++    bool last_sent;
++    bool final_seen;
++    int32_t next_seq;
++    asr_pending_t *pend_head;
++    asr_pending_t *pend_tail;
++    size_t pend_bytes;
++    char text[ASR_TEXT_MAX];
++    char err[ASR_ERR_MAX];
++} asr_state_t;
++
++static asr_state_t s_asr;
++static bool s_inited;
++static uint8_t s_rx[ASR_RX_BUF];
++static size_t s_rx_len;
++
++/* ------------------------------------------------------------------ */
++/* 基础工具                                                            */
++/* ------------------------------------------------------------------ */
++
++static bool asr_ensure_init(void)
++{
++    if (s_inited) {
++        return true;
++    }
++    s_asr.lock = xSemaphoreCreateMutex();
++    s_asr.final_evt = xSemaphoreCreateBinary();
++    if (!s_asr.lock || !s_asr.final_evt) {
++        ESP_LOGE(TAG, "failed to allocate session primitives");
++        return false;
++    }
++    s_inited = true;
++    return true;
++}
++
++/* 调用方需持有 s_asr.lock */
++static void asr_free_pending_locked(void)
++{
++    asr_pending_t *node = s_asr.pend_head;
++    while (node) {
++        asr_pending_t *next = node->next;
++        free(node->frame);
++        free(node);
++        node = next;
++    }
++    s_asr.pend_head = NULL;
++    s_asr.pend_tail = NULL;
++    s_asr.pend_bytes = 0;
++}
++
++/* 组装一帧: 4 字节头 + [可选 4 字节序号] + 4 字节 payload 长度 + payload。 */
++static uint8_t *asr_build_frame(uint8_t msg_type, uint8_t flags, uint8_t serialization,
++                                bool with_seq, int32_t seq,
++                                const void *payload, size_t payload_len, size_t *out_len)
++{
++    size_t head = 4 + (with_seq ? 4 : 0) + 4;
++    uint8_t *buf = malloc(head + payload_len);
++    size_t p = 0;
++    uint32_t n = (uint32_t)payload_len;
++    uint32_t u;
++
++    if (!buf) {
++        return NULL;
++    }
++    buf[p++] = PROTO_VER_HDR;
++    buf[p++] = (uint8_t)((msg_type << 4) | (flags & 0x0F));
++    buf[p++] = (uint8_t)((serialization << 4) | COMP_NONE);
++    buf[p++] = 0x00;
++    if (with_seq) {
++        u = (uint32_t)seq;
++        buf[p++] = (uint8_t)(u >> 24);
++        buf[p++] = (uint8_t)(u >> 16);
++        buf[p++] = (uint8_t)(u >> 8);
++        buf[p++] = (uint8_t)u;
++    }
++    buf[p++] = (uint8_t)(n >> 24);
++    buf[p++] = (uint8_t)(n >> 16);
++    buf[p++] = (uint8_t)(n >> 8);
++    buf[p++] = (uint8_t)n;
++    if (payload_len > 0 && payload) {
++        memcpy(buf + p, payload, payload_len);
++    }
++    *out_len = head + payload_len;
++    return buf;
++}
++
++/* 入队一帧 (保持顺序)。超限时丢弃最旧的音频帧 (永不丢弃仍待发的配置帧)。 */
++static void asr_enqueue(uint8_t *frame, size_t len)
++{
++    asr_pending_t *node;
++
++    if (!frame) {
++        return;
++    }
++    node = calloc(1, sizeof(*node));
++    if (!node) {
++        free(frame);
++        return;
++    }
++    node->frame = frame;
++    node->len = len;
++
++    xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++    while (s_asr.pend_bytes + len > ASR_PEND_MAX && s_asr.pend_head && s_asr.pend_head->next) {
++        asr_pending_t *victim = s_asr.pend_head->next;
++        s_asr.pend_head->next = victim->next;
++        if (s_asr.pend_tail == victim) {
++            s_asr.pend_tail = s_asr.pend_head;
++        }
++        s_asr.pend_bytes -= victim->len;
++        free(victim->frame);
++        free(victim);
++    }
++    if (s_asr.pend_tail) {
++        s_asr.pend_tail->next = node;
++    } else {
++        s_asr.pend_head = node;
++    }
++    s_asr.pend_tail = node;
++    s_asr.pend_bytes += len;
++    xSemaphoreGive(s_asr.lock);
++}
++
++/* 连接就绪时按顺序把挂起帧全部发出 (在 Lua task 上执行, 不阻塞事件回调)。 */
++static void asr_flush_pending(void)
++{
++    esp_websocket_client_handle_t client;
++    asr_pending_t *node;
++
++    if (!s_inited) {
++        return;
++    }
++    xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++    if (!s_asr.client || !s_asr.connected) {
++        xSemaphoreGive(s_asr.lock);
++        return;
++    }
++    client = s_asr.client;
++    node = s_asr.pend_head;
++    s_asr.pend_head = NULL;
++    s_asr.pend_tail = NULL;
++    s_asr.pend_bytes = 0;
++    xSemaphoreGive(s_asr.lock);
++
++    while (node) {
++        asr_pending_t *next = node->next;
++        if (esp_websocket_client_send_bin(client, (const char *)node->frame, (int)node->len,
++                                          pdMS_TO_TICKS(3000)) < 0) {
++            ESP_LOGW(TAG, "ws send failed, dropping %u queued bytes", (unsigned)node->len);
++        }
++        free(node->frame);
++        free(node);
++        node = next;
++    }
++}
++
++/* 从响应 JSON 里取累计识别文本 (兼容 result.text / payload_msg.result.* 等布局)。 */
++static const char *asr_extract_text(cJSON *root)
++{
++    cJSON *result = cJSON_GetObjectItemCaseSensitive(root, "result");
++    cJSON *text;
++
++    if (!result) {
++        cJSON *pm = cJSON_GetObjectItemCaseSensitive(root, "payload_msg");
++        if (cJSON_IsObject(pm)) {
++            result = cJSON_GetObjectItemCaseSensitive(pm, "result");
++        }
++    }
++    if (cJSON_IsString(result) && result->valuestring) {
++        return result->valuestring;
++    }
++    if (cJSON_IsObject(result)) {
++        text = cJSON_GetObjectItemCaseSensitive(result, "text");
++        if (cJSON_IsString(text) && text->valuestring) {
++            return text->valuestring;
++        }
++    }
++    text = cJSON_GetObjectItemCaseSensitive(root, "text");
++    if (cJSON_IsString(text) && text->valuestring) {
++        return text->valuestring;
++    }
++    return NULL;
++}
++
++/* 解析一个完整的服务端包 (调用时不在锁内) */
++static void asr_on_packet(const uint8_t *data, int len)
++{
++    uint8_t msg_type, flags, compression;
++    size_t pos = 4;
++    uint32_t psize;
++    bool flag_last;
++    bool fatal = false;
++    bool mark_final;
++    char new_text[ASR_TEXT_MAX];
++    char errbuf[ASR_ERR_MAX];
++    cJSON *root;
++
++    if (len < 4) {
++        return;
++    }
++    msg_type = (uint8_t)((data[1] >> 4) & 0x0F);
++    flags = (uint8_t)(data[1] & 0x0F);
++    compression = (uint8_t)(data[2] & 0x0F);
++    flag_last = (flags & 0x02) != 0;
++
++    if (flags & 0x01) {
++        pos += 4;
++    }
++    if ((size_t)len < pos + 4) {
++        return;
++    }
++    psize = ((uint32_t)data[pos] << 24) | ((uint32_t)data[pos + 1] << 16) |
++            ((uint32_t)data[pos + 2] << 8) | (uint32_t)data[pos + 3];
++    pos += 4;
++    if (pos + psize > (size_t)len) {
++        psize = (uint32_t)((size_t)len - pos);
++    }
++
++    new_text[0] = '\0';
++    errbuf[0] = '\0';
++
++    if (compression != COMP_NONE) {
++        ESP_LOGW(TAG, "server replied with compression=%u (unsupported)", compression);
++        return;
++    }
++
++    root = cJSON_ParseWithLength((const char *)(data + pos), psize);
++    if (msg_type == MT_SERVER_ERR) {
++        fatal = true;
++        if (root) {
++            cJSON *m = cJSON_GetObjectItemCaseSensitive(root, "message");
++            cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "code");
++            if (cJSON_IsString(m) && m->valuestring && m->valuestring[0]) {
++                snprintf(errbuf, sizeof(errbuf), "%s", m->valuestring);
++            } else if (cJSON_IsNumber(code)) {
++                snprintf(errbuf, sizeof(errbuf), "ASR 错误码 %d", code->valueint);
++            }
++        }
++        if (!errbuf[0]) {
++            snprintf(errbuf, sizeof(errbuf), "ASR 服务端错误");
++        }
++    } else if (root) {
++        cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "code");
++        if (cJSON_IsNumber(code) && code->valueint != 0) {
++            cJSON *m = cJSON_GetObjectItemCaseSensitive(root, "message");
++            fatal = true;
++            if (cJSON_IsString(m) && m->valuestring && m->valuestring[0]) {
++                snprintf(errbuf, sizeof(errbuf), "%s (code %d)", m->valuestring, code->valueint);
++            } else {
++                snprintf(errbuf, sizeof(errbuf), "ASR 错误码 %d", code->valueint);
++            }
++        } else {
++            const char *t = asr_extract_text(root);
++            cJSON *last;
++            if (t) {
++                strlcpy(new_text, t, sizeof(new_text));
++            }
++            last = cJSON_GetObjectItemCaseSensitive(root, "is_last_package");
++            if (cJSON_IsBool(last) && cJSON_IsTrue(last)) {
++                flag_last = true;
++            }
++        }
++    }
++    if (root) {
++        cJSON_Delete(root);
++    }
++
++    xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++    if (new_text[0]) {
++        strlcpy(s_asr.text, new_text, sizeof(s_asr.text));
++    }
++    if (errbuf[0]) {
++        strlcpy(s_asr.err, errbuf, sizeof(s_asr.err));
++    }
++    if (fatal || flag_last) {
++        s_asr.final_seen = true;
++    }
++    mark_final = s_asr.final_seen;
++    xSemaphoreGive(s_asr.lock);
++
++    if (mark_final) {
++        xSemaphoreGive(s_asr.final_evt);
++    }
++}
++
++static void asr_ws_event(void *arg, esp_event_base_t base, int32_t event_id, void *event_data)
++{
++    esp_websocket_event_data_t *ev = (esp_websocket_event_data_t *)event_data;
++
++    (void)arg;
++    (void)base;
++    if (!ev || !s_inited || !s_asr.client || ev->client != s_asr.client) {
++        return;
++    }
++
++    switch (event_id) {
++    case WEBSOCKET_EVENT_CONNECTED:
++        ESP_LOGI(TAG, "ws connected");
++        xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++        s_asr.connected = true;
++        xSemaphoreGive(s_asr.lock);
++        break;
++
++    case WEBSOCKET_EVENT_DATA: {
++        int off = ev->payload_offset;
++        int total = ev->payload_len;
++
++        if (!ev->data_ptr || ev->data_len <= 0) {
++            break;
++        }
++        if (off == 0) {
++            s_rx_len = 0;
++        }
++        if ((size_t)off + (size_t)ev->data_len > sizeof(s_rx)) {
++            ESP_LOGW(TAG, "ws rx overflow (%d + %d)", off, ev->data_len);
++            s_rx_len = 0;
++            break;
++        }
++        memcpy(s_rx + off, ev->data_ptr, ev->data_len);
++        s_rx_len = (size_t)off + (size_t)ev->data_len;
++        if (total <= 0 || s_rx_len >= (size_t)total) {
++            asr_on_packet(s_rx, (int)s_rx_len);
++            s_rx_len = 0;
++        }
++        break;
++    }
++
++    case WEBSOCKET_EVENT_ERROR:
++        ESP_LOGE(TAG, "ws error: type=%d handshake=%d tls_err=0x%x",
++                 ev->error_handle.error_type,
++                 ev->error_handle.esp_ws_handshake_status_code,
++                 (unsigned)ev->error_handle.esp_tls_last_esp_err);
++        xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++        s_asr.connected = false;
++        if (!s_asr.err[0]) {
++            if (ev->error_handle.esp_ws_handshake_status_code > 0) {
++                snprintf(s_asr.err, sizeof(s_asr.err), "ASR 鉴权失败 HTTP %d",
++                         ev->error_handle.esp_ws_handshake_status_code);
++            } else {
++                snprintf(s_asr.err, sizeof(s_asr.err), "ASR 网络连接失败");
++            }
++        }
++        s_asr.final_seen = true;
++        xSemaphoreGive(s_asr.lock);
++        xSemaphoreGive(s_asr.final_evt);
++        break;
++
++    case WEBSOCKET_EVENT_DISCONNECTED:
++    case WEBSOCKET_EVENT_CLOSED:
++        ESP_LOGI(TAG, "ws disconnected");
++        xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++        s_asr.connected = false;
++        {
++            bool was_last = s_asr.last_sent;
++            xSemaphoreGive(s_asr.lock);
++            if (was_last) {
++                xSemaphoreGive(s_asr.final_evt);
++            }
++        }
++        break;
++
++    default:
++        break;
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* action 实现                                                         */
++/* ------------------------------------------------------------------ */
++
++/* 断开并释放当前会话 (不含锁, 供各 action 复用) */
++static void asr_teardown(void)
++{
++    esp_websocket_client_handle_t client;
++
++    if (!s_inited) {
++        return;
++    }
++    xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++    client = s_asr.client;
++    s_asr.client = NULL;
++    s_asr.connected = false;
++    s_asr.last_sent = false;
++    s_asr.final_seen = false;
++    asr_free_pending_locked();
++    xSemaphoreGive(s_asr.lock);
++
++    if (client) {
++        esp_websocket_client_stop(client);
++        esp_websocket_client_destroy(client);
++    }
++}
++
++static void asr_do_start(const char *url, const char *headers, const char *payload_json,
++                         char *out, size_t out_size)
++{
++    esp_websocket_client_config_t cfg = {0};
++    esp_websocket_client_handle_t client;
++    uint8_t *frame;
++    size_t flen = 0;
++    esp_err_t err;
++
++    if (!asr_ensure_init()) {
++        snprintf(out, out_size, "ERR\n内存不足");
++        return;
++    }
++    if (!url || !url[0] || !payload_json || !payload_json[0]) {
++        snprintf(out, out_size, "ERR\n缺少 url 或 payload");
++        return;
++    }
++
++    /* 上一轮若未正常收尾, 先清理, 避免句柄泄漏 */
++    asr_teardown();
++    xSemaphoreTake(s_asr.final_evt, 0);
++
++    cfg.uri = url;
++    cfg.headers = (headers && headers[0]) ? headers : NULL;
++    cfg.buffer_size = ASR_RX_BUF;
++    cfg.task_stack = ASR_WS_STACK;
++    cfg.disable_auto_reconnect = true;
++    cfg.network_timeout_ms = 10000;
++    cfg.crt_bundle_attach = esp_crt_bundle_attach;
++
++    client = esp_websocket_client_init(&cfg);
++    if (!client) {
++        snprintf(out, out_size, "ERR\nWS 客户端创建失败");
++        return;
++    }
++    esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, asr_ws_event, NULL);
++
++    xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++    s_asr.client = client;
++    s_asr.next_seq = 2;   /* 服务端把配置帧计为序号 1, 音频须从 2 起 (否则 autoAssignedSequence mismatch 断开) */
++    s_asr.text[0] = '\0';
++    s_asr.err[0] = '\0';
++    xSemaphoreGive(s_asr.lock);
++
++    err = esp_websocket_client_start(client);
++    if (err != ESP_OK) {
++        asr_teardown();
++        snprintf(out, out_size, "ERR\nWS 启动失败: %s", esp_err_to_name(err));
++        return;
++    }
++
++    /* 配置帧先入队, 保证连接就绪后最先发出 */
++    frame = asr_build_frame(MT_FULL_CLIENT, FL_NONE, SER_JSON, false, 0,
++                            payload_json, strlen(payload_json), &flen);
++    if (!frame) {
++        asr_teardown();
++        snprintf(out, out_size, "ERR\n内存不足");
++        return;
++    }
++    asr_enqueue(frame, flen);
++
++    ESP_LOGI(TAG, "session start queued: %s (config %u bytes, %s headers)",
++             url, (unsigned)strlen(payload_json), cfg.headers ? "with" : "no");
++    snprintf(out, out_size, "OK");
++}
++
++static void asr_do_audio(const char *b64, char *out, size_t out_size)
++{
++    size_t b64_len, pcm_cap, pcm_len = 0, flen = 0;
++    uint8_t *pcm, *frame;
++    int32_t seq;
++
++    if (!s_inited) {
++        snprintf(out, out_size, "ERR\n会话未初始化");
++        return;
++    }
++    xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++    if (!s_asr.client) {
++        xSemaphoreGive(s_asr.lock);
++        snprintf(out, out_size, "ERR\n会话未开始");
++        return;
++    }
++    seq = s_asr.next_seq++;
++    xSemaphoreGive(s_asr.lock);
++
++    if (!b64 || !b64[0]) {
++        snprintf(out, out_size, "OK");
++        return;
++    }
++    b64_len = strlen(b64);
++    pcm_cap = (b64_len / 4 + 1) * 3;
++    pcm = malloc(pcm_cap);
++    if (!pcm) {
++        snprintf(out, out_size, "ERR\n内存不足");
++        return;
++    }
++    if (mbedtls_base64_decode(pcm, pcm_cap, &pcm_len, (const unsigned char *)b64, b64_len) != 0) {
++        free(pcm);
++        snprintf(out, out_size, "ERR\n音频编码错误");
++        return;
++    }
++    if (pcm_len == 0) {
++        free(pcm);
++        snprintf(out, out_size, "OK");
++        return;
++    }
++
++    frame = asr_build_frame(MT_AUDIO_ONLY, FL_SEQ_POS, SER_NONE, true, seq, pcm, pcm_len, &flen);
++    free(pcm);
++    if (!frame) {
++        snprintf(out, out_size, "ERR\n内存不足");
++        return;
++    }
++    asr_enqueue(frame, flen);
++    asr_flush_pending();
++    snprintf(out, out_size, "OK");
++}
++
++static void asr_do_poll(char *out, size_t out_size)
++{
++    char errbuf[ASR_ERR_MAX];
++    char text[ASR_TEXT_MAX];
++
++    if (!s_inited) {
++        snprintf(out, out_size, "ERR\n会话未初始化");
++        return;
++    }
++    xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++    strlcpy(errbuf, s_asr.err, sizeof(errbuf));
++    strlcpy(text, s_asr.text, sizeof(text));
++    xSemaphoreGive(s_asr.lock);
++
++    if (errbuf[0]) {
++        snprintf(out, out_size, "ERR\n%s", errbuf);
++        return;
++    }
++    snprintf(out, out_size, "TEXT\n%s", text);
++}
++
++static void asr_do_finish(int timeout_ms, char *out, size_t out_size)
++{
++    esp_websocket_client_handle_t client;
++    int32_t seq = 0;
++    bool need_last = false;
++    char text[ASR_TEXT_MAX];
++    char errbuf[ASR_ERR_MAX];
++
++    if (!s_inited) {
++        snprintf(out, out_size, "ERR\n会话未初始化");
++        return;
++    }
++    xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++    client = s_asr.client;
++    if (client && !s_asr.last_sent) {
++        s_asr.last_sent = true;
++        seq = s_asr.next_seq++;
++        need_last = true;
++    }
++    xSemaphoreGive(s_asr.lock);
++
++    if (!client) {
++        snprintf(out, out_size, "ERR\n会话未开始");
++        return;
++    }
++
++    if (need_last) {
++        /* 末包: flags=0b0011 且序号取负 */
++        size_t flen = 0;
++        uint8_t *frame = asr_build_frame(MT_AUDIO_ONLY, FL_LAST_NEG_SEQ, SER_NONE,
++                                        true, -seq, NULL, 0, &flen);
++        if (frame) {
++            asr_enqueue(frame, flen);
++        }
++    }
++    asr_flush_pending();
++
++    /* 等待服务端末包响应 (超时也继续取已有文本) */
++    xSemaphoreTake(s_asr.final_evt, pdMS_TO_TICKS(timeout_ms > 0 ? timeout_ms : 5000));
++
++    xSemaphoreTake(s_asr.lock, portMAX_DELAY);
++    strlcpy(text, s_asr.text, sizeof(text));
++    strlcpy(errbuf, s_asr.err, sizeof(errbuf));
++    xSemaphoreGive(s_asr.lock);
++
++    asr_teardown();
++
++    if (!text[0] && errbuf[0]) {
++        snprintf(out, out_size, "ERR\n%s", errbuf);
++        return;
++    }
++    snprintf(out, out_size, "FINAL\n%s", text);
++}
++
++static esp_err_t cap_asr_stream_execute(const char *input_json,
++                                        const claw_cap_call_context_t *ctx,
++                                        char *output,
++                                        size_t output_size)
++{
++    cJSON *root;
++    cJSON *item;
++    const char *action;
++
++    (void)ctx;
++    if (!input_json || !output || output_size == 0) {
++        return ESP_ERR_INVALID_ARG;
++    }
++    output[0] = '\0';
++
++    root = cJSON_Parse(input_json);
++    if (!root) {
++        snprintf(output, output_size, "ERR\n参数解析失败");
++        return ESP_OK;
++    }
++    item = cJSON_GetObjectItemCaseSensitive(root, "action");
++    action = (cJSON_IsString(item) && item->valuestring) ? item->valuestring : "";
++
++    if (strcmp(action, "start") == 0) {
++        cJSON *url = cJSON_GetObjectItemCaseSensitive(root, "url");
++        cJSON *headers = cJSON_GetObjectItemCaseSensitive(root, "headers");
++        cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload_json");
++        asr_do_start(cJSON_IsString(url) ? url->valuestring : NULL,
++                     cJSON_IsString(headers) ? headers->valuestring : NULL,
++                     cJSON_IsString(payload) ? payload->valuestring : NULL,
++                     output, output_size);
++    } else if (strcmp(action, "audio") == 0) {
++        cJSON *pcm = cJSON_GetObjectItemCaseSensitive(root, "pcm");
++        asr_do_audio(cJSON_IsString(pcm) ? pcm->valuestring : NULL, output, output_size);
++    } else if (strcmp(action, "poll") == 0) {
++        asr_do_poll(output, output_size);
++    } else if (strcmp(action, "finish") == 0) {
++        cJSON *tmo = cJSON_GetObjectItemCaseSensitive(root, "timeout_ms");
++        int timeout_ms = cJSON_IsNumber(tmo) ? tmo->valueint : 5000;
++        asr_do_finish(timeout_ms, output, output_size);
++    } else if (strcmp(action, "abort") == 0) {
++        asr_teardown();
++        snprintf(output, output_size, "OK");
++    } else {
++        snprintf(output, output_size, "ERR\n未知 action: %s", action);
++    }
++
++    cJSON_Delete(root);
++    return ESP_OK;
++}
++
++static const claw_cap_descriptor_t s_asr_stream_descriptors[] = {
++    {
++        .id = "asr_stream",
++        .name = "asr_stream",
++        .family = "media",
++        .description = "Streaming speech recognition session over WebSocket (Volcengine sauc protocol).",
++        .kind = CLAW_CAP_KIND_CALLABLE,
++        .cap_flags = 0,
++        .input_schema_json =
++        "{\"type\":\"object\",\"properties\":{"
++        "\"action\":{\"type\":\"string\",\"enum\":[\"start\",\"audio\",\"poll\",\"finish\",\"abort\"]},"
++        "\"url\":{\"type\":\"string\"},"
++        "\"headers\":{\"type\":\"string\"},"
++        "\"payload_json\":{\"type\":\"string\"},"
++        "\"pcm\":{\"type\":\"string\"},"
++        "\"timeout_ms\":{\"type\":\"integer\"}},"
++        "\"required\":[\"action\"]}",
++        .execute = cap_asr_stream_execute,
++    },
++};
++
++static const claw_cap_group_t s_asr_stream_group = {
++    .group_id = "cap_asr_stream",
++    .descriptors = s_asr_stream_descriptors,
++    .descriptor_count = sizeof(s_asr_stream_descriptors) / sizeof(s_asr_stream_descriptors[0]),
++};
++
++esp_err_t cap_asr_stream_register_group(void)
++{
++    if (claw_cap_group_exists(s_asr_stream_group.group_id)) {
++        return ESP_OK;
++    }
++
++    return claw_cap_register_group(&s_asr_stream_group);
++}
+diff --git a/components/common/app_claw/Kconfig b/components/common/app_claw/Kconfig
+index 184c7b7..795a98a 100644
+--- a/components/common/app_claw/Kconfig
++++ b/components/common/app_claw/Kconfig
+@@ -170,6 +170,13 @@ menu "App Claw Config"
+                 Enable the web search capability and keep app_claw's direct dependency
+                 on cap_web_search.
+ 
++        config APP_CLAW_CAP_ASR_STREAM
++            bool "Enable streaming ASR capability"
++            default y
++            help
++                Enable the streaming ASR (WebSocket) capability and keep app_claw's
++                direct dependency on cap_asr_stream.
++
+         config APP_CLAW_CAP_ROUTER_MGR
+             bool "Enable router manager capability"
+             select APP_CLAW_CAP_EVENT_ROUTER
+diff --git a/components/common/app_claw/app_capabilities.c b/components/common/app_claw/app_capabilities.c
+index 2e6194f..166dc99 100644
+--- a/components/common/app_claw/app_capabilities.c
++++ b/components/common/app_claw/app_capabilities.c
+@@ -64,6 +64,9 @@
+ #if CONFIG_APP_CLAW_CAP_WEB_SEARCH
+ #include "cap_web_search.h"
+ #endif
++#if CONFIG_APP_CLAW_CAP_ASR_STREAM
++#include "cap_asr_stream.h"
++#endif
+ #include "claw_cap.h"
+ #if CONFIG_APP_CLAW_CAP_MEMORY
+ #include "claw_memory.h"
+@@ -656,6 +659,16 @@ static esp_err_t app_cap_register_router_mgr(const app_claw_config_t *config,
+ }
+ #endif
+ 
++#if CONFIG_APP_CLAW_CAP_ASR_STREAM
++static esp_err_t app_cap_register_asr_stream(const app_claw_config_t *config,
++                                             const app_claw_storage_paths_t *paths)
++{
++    (void)config;
++    (void)paths;
++    return cap_asr_stream_register_group();
++}
++#endif
++
+ #if CONFIG_APP_CLAW_CAP_SESSION_MGR
+ static esp_err_t app_cap_register_session_mgr(const app_claw_config_t *config,
+                                               const app_claw_storage_paths_t *paths)
+@@ -725,6 +738,9 @@ static const app_capability_group_entry_t s_capability_group_entries[] = {
+ #if CONFIG_APP_CLAW_CAP_WEB_SEARCH
+     { "cap_web_search", "Web Search", "Register web search cap", true, app_cap_prepare_web_search, app_cap_register_web_search },
+ #endif
++#if CONFIG_APP_CLAW_CAP_ASR_STREAM
++    { "cap_asr_stream", "Streaming ASR", "Register streaming ASR cap", false, NULL, app_cap_register_asr_stream },
++#endif
+ #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
+     { "cap_router_mgr", "Router Manager", "Register router manager cap", true, NULL, app_cap_register_router_mgr },
+ #endif
+@@ -782,6 +798,9 @@ static const app_capability_group_info_t s_capability_group_infos[] = {
+ #if CONFIG_APP_CLAW_CAP_WEB_SEARCH
+     { "cap_web_search", "Web Search", false },
+ #endif
++#if CONFIG_APP_CLAW_CAP_ASR_STREAM
++    { "cap_asr_stream", "Streaming ASR", false },
++#endif
+ #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
+     { "cap_router_mgr", "Router Manager", false },
+ #endif
+diff --git a/components/common/app_claw/idf_component.yml b/components/common/app_claw/idf_component.yml
+index 30472c3..ed29bf7 100644
+--- a/components/common/app_claw/idf_component.yml
++++ b/components/common/app_claw/idf_component.yml
+@@ -89,6 +89,11 @@ dependencies:
+       - if: $CONFIG{APP_CLAW_CAP_WEB_SEARCH} == True
+     path: ../../claw_capabilities/cap_web_search
+ 
++  cap_asr_stream:
++    rules:
++      - if: $CONFIG{APP_CLAW_CAP_ASR_STREAM} == True
++    path: ../../claw_capabilities/cap_asr_stream
++
+   claw_cap:
+     path: ../../claw_modules/claw_cap
+ 

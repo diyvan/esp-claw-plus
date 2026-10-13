@@ -1,0 +1,34 @@
+**/.git/
+**/.gitmodules
+**/.gitattributes
+!/.gitattributes
+**/.gitkeep
+**/.vscode
+**/.gitindex
+**/.gitlog
+**/.git-*
+**/.idea
+**/build
+**/build-rev1_3/
+**/build-rev3_x/
+**/managed_components
+**/dependencies.lock
+**/sdkconfig
+**/sdkconfig.old
+**/sdkconfig.rev1_3
+**/sdkconfig.rev3_x
+/.ci-cache/
+/ci-artifacts/
+**/__pycache__/
+**/*.py[cod]
+/ci-routing-report*.json
+
+# solutions/esp-claw-plus: esp-claw 上游源码由 scripts/setup_esp_claw.sh 获取, 不入库
+/solutions/esp-claw-plus/esp-claw/
+# solutions/esp-claw-plus: 验证脚本产出的串口/构建日志, 不入库
+/solutions/esp-claw-plus/logs/
+
+# 预编译固件产物, 不入库
+/firmware/*.bin
+# macOS 目录元数据
+**/.DS_Store

@@ -1,0 +1,92 @@
+version: 1.0.0
+# Peripherals Configuration for Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5
+# 注意: 本板 I2S 的 DOUT=GPIO9 / DIN=GPIO11, 与 p4_nano (dout=11/din=9) 相反
+# LCD(ST7796: MOSI=20/CLK=21/CS=23/DC=26/RST=27/背光=28)与
+# 触摸(FT6336: RST=29/INT=50, 共 i2c_master 总线)为 M1 里程碑接入
+peripherals:
+  # I2C Configuration for codec (ES8311) and sensors (FT6336/AXP2101)
+  - name: i2c_master
+    type: i2c
+    role: master
+    config:
+      port: 0
+      pins:
+        sda: 7
+        scl: 8
+
+  # I2S Audio Output for ES8311 codec
+  - name: i2s_audio_out
+    type: i2s
+    format: "std-out"
+    role: master
+    config:
+      port: 0
+      sample_rate_hz: 48000
+      clk_src: "I2S_CLK_SRC_DEFAULT"
+      mclk_multiple: 256
+      data_bit_width: 16
+      slot_mode: "I2S_SLOT_MODE_STEREO"
+      slot_mask: "I2S_STD_SLOT_BOTH"
+      ws_width: 16
+      pins:
+        mclk: 13
+        bclk: 12
+        ws: 10
+        dout: 9
+        din: 11
+
+  # I2S Audio Input for ES8311 codec
+  - name: i2s_audio_in
+    type: i2s
+    format: "std-in"
+    role: master
+    config:
+      port: 0
+      sample_rate_hz: 48000
+      clk_src: "I2S_CLK_SRC_DEFAULT"
+      mclk_multiple: 256
+      data_bit_width: 16
+      slot_mode: "I2S_SLOT_MODE_STEREO"
+      slot_mask: "I2S_STD_SLOT_BOTH"
+      ws_width: 16
+      pins:
+        mclk: 13
+        bclk: 12
+        ws: 10
+        dout: 9
+        din: 11
+
+  # PA Control GPIO (板载功放使能)
+  - name: gpio_pa_control
+    type: gpio
+    role: io
+    config:
+      pin: 53
+      mode: GPIO_MODE_OUTPUT
+      pull_up: true
+      default_level: 0
+
+  # M1: ST7796 LCD SPI 总线 (BSP: MOSI=20, CLK=21; 只写, 无 MISO)
+  - name: spi_display
+    type: spi
+    role: master
+    config:
+      spi_bus_config:
+        spi_port: SPI2_HOST
+        mosi_io_num: 20
+        miso_io_num: -1
+        sclk_io_num: 21
+        max_transfer_sz: 307200   # 320*480*2, 整屏一行缓冲上限
+
+  # M1: LCD 背光 PWM (BSP: BACKLIGHT=28)
+  - name: ledc_backlight
+    type: ledc
+    version: default
+    config:
+      gpio_num: 28
+      speed_mode: LEDC_LOW_SPEED_MODE
+      channel: 0
+      timer_sel: 0
+      duty: 1023
+      duty_resolution: LEDC_TIMER_10_BIT
+      output_invert: false

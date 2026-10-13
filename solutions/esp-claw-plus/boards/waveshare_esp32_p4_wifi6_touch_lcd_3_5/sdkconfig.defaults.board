@@ -1,0 +1,45 @@
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+#
+# Chip revision: 本板为 rev1.3 (< v3), 与仓库 rev1_3 配置档一致
+#
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+CONFIG_ESP32P4_REV_MIN_300=n
+
+#
+# Console: 本板板载 USB-UART 桥接在 UART0 (GPIO37/38)，日志必须走 UART 主 console，
+# 否则 bootloader/app 日志被送到未连接的 P4 原生 USB-Serial/JTAG 口 → 完全静默。
+# 与仓库已验证示例 (02_HelloWorld / 07_Displaycolorbar / 11_brookesia) 保持一致。
+#
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED=y
+
+#
+# Audio Configuration for ES8311 codec
+#
+CONFIG_ESP_CODEC_DEV_ES8311_USE_DEFAULT_CALIB_IN_FLASH=y
+
+#
+# LVGL 字体格式: 必须开启大字体模式。
+# emote 资产字体 (font_puhui_common_*.bin) 的 glyph_dsc 是 16 字节条目
+# (bitmap_index/adv_w 都是 u32), 即按 LV_FONT_FMT_TXT_LARGE=1 生成;
+# esp_emote_gfx 的 gfx_glyph_dsc_t 也按同一布局定义。
+# 若保持默认 0, glyph 条目按 8 字节步长读取 -> 字形索引整体错位 -> 渲染乱码。
+#
+CONFIG_LV_FONT_FMT_TXT_LARGE=y
+
+#
+# esp-sr 本地唤醒词 (WakeNet9) + VAD 检测。
+# 唤醒词: 嗨小欧 (wn9_hai1xiao3ou1_tts3) —— 官方 TTS Pipeline V3 训练, 免费商用, 无需自行训练。
+# 模型由 esp-sr 的 movemodel.py 按 sdkconfig 打包为 srmodels.bin 并烧入 model 分区。
+#
+CONFIG_SR_WN_WN9_HAI1XIAO3OU1_TTS3=y
+CONFIG_SR_VADN_VADNET1_MEDIUM=y

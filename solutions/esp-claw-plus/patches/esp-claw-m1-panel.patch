@@ -1,0 +1,27 @@
+diff --git a/application/edge_agent/main/main.c b/application/edge_agent/main/main.c
+index 2a426fe..17904f9 100644
+--- a/application/edge_agent/main/main.c
++++ b/application/edge_agent/main/main.c
+@@ -29,6 +29,7 @@
+ #include "cap_im_wechat.h"
+ #endif
+ #include "app_config.h"
++#include "ha_panel.h"
+ 
+ #define APP_ENABLE_MEM_LOG        (0)
+ 
+@@ -330,6 +331,14 @@ void app_main(void)
+     init_timezone(app_config_get_timezone(s_config)); // no need to check error
+     ESP_ERROR_CHECK(esp_board_manager_init());
+     ESP_ERROR_CHECK(app_claw_ui_start());
++
++    /* M1: take the display over with the application-layer LVGL panel.
++     * Non-fatal: if it fails, the emote/expression UI keeps the screen. */
++    esp_err_t panel_err = ha_panel_start();
++    if (panel_err != ESP_OK) {
++        ESP_LOGW(TAG, "HA panel start failed: %s", esp_err_to_name(panel_err));
++    }
++
+     ESP_ERROR_CHECK(app_fs_init());
+ 
+     /* Publish the resolved storage roots so any component can compose paths

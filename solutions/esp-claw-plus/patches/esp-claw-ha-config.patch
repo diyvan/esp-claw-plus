@@ -1,0 +1,82 @@
+diff --git a/application/edge_agent/components/app_config/app_config.c b/application/edge_agent/components/app_config/app_config.c
+index 96f3cb1..aff6b55 100644
+--- a/application/edge_agent/components/app_config/app_config.c
++++ b/application/edge_agent/components/app_config/app_config.c
+@@ -61,6 +61,8 @@ typedef struct {
+ #define APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS   ""
+ #define APP_DEFAULT_ENABLED_LUA_MODULES      ""
+ #define APP_DEFAULT_TIME_TIMEZONE            "CST-8"
++#define APP_DEFAULT_HA_BASE_URL              ""
++#define APP_DEFAULT_HA_TOKEN                 ""
+ 
+ static const app_config_field_t s_fields[] = {
+     APP_CONFIG_FIELD(wifi_ssid, "wifi_ssid", APP_WIFI_SSID),
+@@ -97,6 +99,8 @@ static const app_config_field_t s_fields[] = {
+     APP_CONFIG_FIELD(llm_visible_cap_groups, "vis_cap_groups", APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS),
+     APP_CONFIG_FIELD(enabled_lua_modules, "en_lua_mods", APP_DEFAULT_ENABLED_LUA_MODULES),
+     APP_CONFIG_FIELD(time_timezone, "time_timezone", APP_DEFAULT_TIME_TIMEZONE),
++    APP_CONFIG_FIELD(ha_base_url, "ha_base_url", APP_DEFAULT_HA_BASE_URL),
++    APP_CONFIG_FIELD(ha_token, "ha_token", APP_DEFAULT_HA_TOKEN),
+ };
+ 
+ // for backward compatibility, migrate from old settings to new settings
+@@ -587,6 +591,8 @@ void app_config_to_claw(const app_config_t *config, app_claw_config_t *out)
+     strlcpy(out->enabled_cap_groups, config->enabled_cap_groups, sizeof(out->enabled_cap_groups));
+     strlcpy(out->llm_visible_cap_groups, config->llm_visible_cap_groups, sizeof(out->llm_visible_cap_groups));
+     strlcpy(out->enabled_lua_modules, config->enabled_lua_modules, sizeof(out->enabled_lua_modules));
++    strlcpy(out->ha_base_url, config->ha_base_url, sizeof(out->ha_base_url));
++    strlcpy(out->ha_token, config->ha_token, sizeof(out->ha_token));
+ }
+ 
+ const char *app_config_get_timezone(const app_config_t *config)
+diff --git a/application/edge_agent/components/app_config/include/app_config.h b/application/edge_agent/components/app_config/include/app_config.h
+index 1f7f55b..e2dc1f1 100644
+--- a/application/edge_agent/components/app_config/include/app_config.h
++++ b/application/edge_agent/components/app_config/include/app_config.h
+@@ -54,6 +54,8 @@ typedef struct {
+     char llm_visible_cap_groups[APP_CONFIG_STR_LEN];
+     char enabled_lua_modules[APP_CONFIG_STR_LEN];
+     char time_timezone[APP_CONFIG_TIMEZONE_LEN];
++    char ha_base_url[APP_CONFIG_STR_LEN];
++    char ha_token[APP_CONFIG_STR_LEN];
+ } app_config_t;
+ 
+ esp_err_t app_config_init(void);
+diff --git a/application/edge_agent/components/http_server/http_server_config_api.c b/application/edge_agent/components/http_server/http_server_config_api.c
+index 96d44b7..6339bef 100644
+--- a/application/edge_agent/components/http_server/http_server_config_api.c
++++ b/application/edge_agent/components/http_server/http_server_config_api.c
+@@ -76,6 +76,9 @@ static const config_field_def_t CONFIG_FIELDS[] = {
+     CONFIG_FIELD("skills",       enabled_lua_modules),
+ 
+     CONFIG_FIELD("time",         time_timezone),
++
++    CONFIG_FIELD("ha",           ha_base_url),
++    CONFIG_FIELD("ha",           ha_token),
+ };
+ 
+ static const size_t CONFIG_FIELD_COUNT = sizeof(CONFIG_FIELDS) / sizeof(CONFIG_FIELDS[0]);
+diff --git a/components/common/app_claw/include/app_claw.h b/components/common/app_claw/include/app_claw.h
+index bd01fe3..8e64c02 100644
+--- a/components/common/app_claw/include/app_claw.h
++++ b/components/common/app_claw/include/app_claw.h
+@@ -52,6 +52,8 @@ typedef struct {
+     char enabled_cap_groups[APP_CLAW_STR_LEN];
+     char llm_visible_cap_groups[APP_CLAW_STR_LEN];
+     char enabled_lua_modules[APP_CLAW_STR_LEN];
++    char ha_base_url[APP_CLAW_STR_LEN];
++    char ha_token[APP_CLAW_STR_LEN];
+ } app_claw_config_t;
+ 
+ typedef esp_err_t (*app_claw_save_config_fn)(const app_claw_config_t *config,
+--- a/application/edge_agent/main/main.c
++++ b/application/edge_agent/main/main.c
+@@ -146,6 +146,8 @@
+     strlcpy(dst->llm_image_remote_url_only,
+             src->llm_image_remote_url_only,
+             sizeof(dst->llm_image_remote_url_only));
++    strlcpy(dst->ha_base_url, src->ha_base_url, sizeof(dst->ha_base_url));
++    strlcpy(dst->ha_token, src->ha_token, sizeof(dst->ha_token));
+ }
+ 
+ static esp_err_t main_save_claw_config(const app_claw_config_t *config, void *user_ctx)

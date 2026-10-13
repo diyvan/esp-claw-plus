@@ -1,0 +1,51 @@
+[
+  {
+    "id": "local_scene_command",
+    "description": "Handle offline local scene commands (scene:home / scene:away / scene:night) with a deterministic Lua rule, without the LLM.",
+    "enabled": true,
+    "consume_on_match": true,
+    "ack": "local scene command handled",
+    "match": {
+      "event_type": "message",
+      "event_key": "text",
+      "content_type": "text",
+      "text": "scene:",
+      "text_match_rule": "prefix"
+    },
+    "actions": [
+      {
+        "type": "run_script",
+        "input": {
+          "path": "/system/skills/local_scene/scripts/local_scene.lua",
+          "args": {
+            "scene": "{{match.remainder}}"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "startup_local_scene",
+    "description": "Restore the persisted local scene after boot (offline, no LLM).",
+    "enabled": true,
+    "consume_on_match": false,
+    "ack": "local scene restored",
+    "match": {
+      "source_cap": "app_claw",
+      "event_type": "startup",
+      "event_key": "boot_completed",
+      "content_type": "trigger"
+    },
+    "actions": [
+      {
+        "type": "run_script",
+        "input": {
+          "path": "/system/skills/local_scene/scripts/local_scene.lua",
+          "args": {
+            "scene": "boot"
+          }
+        }
+      }
+    ]
+  }
+]

@@ -1,0 +1,56 @@
+diff --git a/components/claw_capabilities/cap_mcp_client/CMakeLists.txt b/components/claw_capabilities/cap_mcp_client/CMakeLists.txt
+index 5d118b1..eae8042 100644
+--- a/components/claw_capabilities/cap_mcp_client/CMakeLists.txt
++++ b/components/claw_capabilities/cap_mcp_client/CMakeLists.txt
+@@ -12,5 +12,5 @@ idf_component_register(
+         esp_http_client
+         mcp-c-sdk
+         mcp_mdns
+-        json
++        cjson
+ )
+diff --git a/components/common/mcp_mdns/CMakeLists.txt b/components/common/mcp_mdns/CMakeLists.txt
+index 4bff3db..91af932 100644
+--- a/components/common/mcp_mdns/CMakeLists.txt
++++ b/components/common/mcp_mdns/CMakeLists.txt
+@@ -6,6 +6,6 @@ idf_component_register(
+         "include"
+     REQUIRES
+         esp_netif
+-        json
++        cjson
+         mdns
+ )
+diff --git a/components/common/mcp_mdns/idf_component.yml b/components/common/mcp_mdns/idf_component.yml
+index 45c52a4..e85857b 100644
+--- a/components/common/mcp_mdns/idf_component.yml
++++ b/components/common/mcp_mdns/idf_component.yml
+@@ -1,2 +1,4 @@
+ dependencies:
+   espressif/mdns: "^1.10.1"
++  # IDF v6 移除内置 json 组件, cJSON 改由组件管理器提供(组件名为 cjson)
++  espressif/cjson: "*"
+diff --git a/application/edge_agent/tools/cmake/esp_idf_patch.cmake b/application/edge_agent/tools/cmake/esp_idf_patch.cmake
+index 0470493..d2c5ad2 100644
+--- a/application/edge_agent/tools/cmake/esp_idf_patch.cmake
++++ b/application/edge_agent/tools/cmake/esp_idf_patch.cmake
+@@ -112,7 +112,18 @@ edge_agent_patch_file_replace_literal(
+ )
+ 
+ # The preprocessed S31 linker script depends on this included fragment, but Ninja only tracks the top-level input.
+-file(TOUCH_NOCREATE "$ENV{IDF_PATH}/components/esp_system/ld/esp32s31/sections.ld.in")
++# Tolerate a read-only ESP-IDF install: the touch is only a Ninja re-run hint and the
++# S31 fragment is irrelevant when building for ESP32-P4.
++execute_process(
++    COMMAND ${CMAKE_COMMAND} -E touch_nocreate
++            "$ENV{IDF_PATH}/components/esp_system/ld/esp32s31/sections.ld.in"
++    RESULT_VARIABLE _edge_agent_touch_rc
++    OUTPUT_QUIET
++    ERROR_QUIET
++)
++if(NOT _edge_agent_touch_rc EQUAL 0)
++    message(STATUS "[edge_agent] sections.ld.in touch skipped (read-only IDF install)")
++endif()
+ 
+ # Add esp_http_client_set_event_handler declaration to esp_http_client.c
+ edge_agent_patch_file_replace(

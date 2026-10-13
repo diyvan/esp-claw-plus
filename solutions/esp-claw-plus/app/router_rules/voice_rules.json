@@ -1,0 +1,50 @@
+[
+  {
+    "id": "voice_reply_run_script",
+    "description": "Route agent replies for the on-device voice channel to the TTS Lua script.",
+    "enabled": true,
+    "consume_on_match": true,
+    "ack": "voice reply dispatched",
+    "match": {
+      "source_cap": "claw_core",
+      "event_type": "out_message",
+      "content_type": "text",
+      "chat_id": "voice"
+    },
+    "actions": [
+      {
+        "type": "run_script",
+        "input": {
+          "async": true,
+          "path": "/system/skills/voice/scripts/voice_reply.lua",
+          "args": {
+            "text": "{{event.text}}"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "startup_voice_ptt",
+    "description": "Start the persistent BOOT-key push-to-talk loop after boot.",
+    "enabled": true,
+    "consume_on_match": false,
+    "ack": "voice ptt started",
+    "match": {
+      "source_cap": "app_claw",
+      "event_type": "startup",
+      "event_key": "boot_completed",
+      "content_type": "trigger"
+    },
+    "actions": [
+      {
+        "type": "run_script",
+        "input": {
+          "async": true,
+          "path": "/system/skills/voice/scripts/voice_ptt.lua",
+          "args": {}
+        }
+      }
+    ]
+  }
+]

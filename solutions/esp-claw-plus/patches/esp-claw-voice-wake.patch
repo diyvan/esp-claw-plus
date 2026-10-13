@@ -1,0 +1,348 @@
+diff --git a/application/edge_agent/main/idf_component.yml b/application/edge_agent/main/idf_component.yml
+--- a/application/edge_agent/main/idf_component.yml
++++ b/application/edge_agent/main/idf_component.yml
+@@ -40,7 +40,10 @@ dependencies:
+   emote:
+     path: ../../../components/common/emote
+     rules:
+       - if: $CONFIG{ESP_BOARD_DEV_DISPLAY_LCD_SUPPORT} == True
+ 
++  ha_voice_arbiter:
++    path: ../../../components/common/ha_voice_arbiter
++
+   http_reuse:
+     path: ../../../components/common/http_reuse
+ 
+diff --git a/components/common/ha_voice_arbiter/CMakeLists.txt b/components/common/ha_voice_arbiter/CMakeLists.txt
+new file mode 100644
+index 0000000..397cdc9
+--- /dev/null
++++ b/components/common/ha_voice_arbiter/CMakeLists.txt
+@@ -0,0 +1,6 @@
++idf_component_register(
++    SRCS
++        "ha_voice_arbiter.c"
++    INCLUDE_DIRS
++        "include"
++)
+diff --git a/components/common/ha_voice_arbiter/ha_voice_arbiter.c b/components/common/ha_voice_arbiter/ha_voice_arbiter.c
+new file mode 100644
+index 0000000..1213983
+--- /dev/null
++++ b/components/common/ha_voice_arbiter/ha_voice_arbiter.c
+@@ -0,0 +1,126 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#include "ha_voice_arbiter.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "esp_log.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/semphr.h"
++
++static const char *TAG = "ha_voice_arb";
++
++/* Binary semaphore: given == microphone is free. */
++static SemaphoreHandle_t s_mic_sem;
++/* Advisory flags, only meaningful once the arbiter is initialised. */
++static volatile bool s_capture_active;
++static volatile bool s_handoff;
++
++static bool ha_voice_arbiter_ready(void)
++{
++    return s_mic_sem != NULL;
++}
++
++esp_err_t ha_voice_arbiter_init(void)
++{
++    if (s_mic_sem != NULL) {
++        return ESP_OK;
++    }
++
++    SemaphoreHandle_t sem = xSemaphoreCreateBinary();
++    if (sem == NULL) {
++        ESP_LOGE(TAG, "failed to create microphone semaphore");
++        return ESP_ERR_NO_MEM;
++    }
++    xSemaphoreGive(sem);
++
++    s_capture_active = false;
++    s_handoff = false;
++    s_mic_sem = sem;
++
++    ESP_LOGI(TAG, "microphone arbiter ready");
++    return ESP_OK;
++}
++
++bool ha_voice_arbiter_acquire(uint32_t timeout_ms)
++{
++    if (!ha_voice_arbiter_ready()) {
++        return true; /* degrade to no arbitration */
++    }
++
++    s_capture_active = true;
++
++    if (xSemaphoreTake(s_mic_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
++        ESP_LOGD(TAG, "capture acquired microphone");
++        return true;
++    }
++
++    s_capture_active = false;
++    ESP_LOGW(TAG, "capture acquire timed out after %u ms", (unsigned)timeout_ms);
++    return false;
++}
++
++void ha_voice_arbiter_release(void)
++{
++    if (!ha_voice_arbiter_ready()) {
++        return;
++    }
++
++    s_capture_active = false;
++    s_handoff = false;
++    xSemaphoreGive(s_mic_sem);
++    ESP_LOGD(TAG, "capture released microphone");
++}
++
++bool ha_voice_arbiter_afe_acquire(uint32_t timeout_ms)
++{
++    if (!ha_voice_arbiter_ready()) {
++        return true; /* degrade to no arbitration */
++    }
++
++    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
++    while (s_handoff || s_capture_active) {
++        if (xTaskGetTickCount() >= deadline) {
++            /* A capture session would have started by now; drop a stale handoff
++             * so the listener can resume even if no recording follows the wake. */
++            if (s_capture_active) {
++                return false; /* never preempt an in-flight capture */
++            }
++            ESP_LOGW(TAG, "dropping stale handoff");
++            s_handoff = false;
++            break;
++        }
++        vTaskDelay(pdMS_TO_TICKS(10));
++    }
++
++    if (xSemaphoreTake(s_mic_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
++        return true;
++    }
++
++    return false;
++}
++
++void ha_voice_arbiter_afe_release(void)
++{
++    if (!ha_voice_arbiter_ready()) {
++        return;
++    }
++
++    /* Keep s_handoff untouched: a pending handoff must survive until the
++     * capture side releases the mic. */
++    xSemaphoreGive(s_mic_sem);
++}
++
++bool ha_voice_arbiter_yield_requested(void)
++{
++    return s_capture_active || s_handoff;
++}
++
++void ha_voice_arbiter_hold_for_capture(void)
++{
++    s_handoff = true;
++}
+diff --git a/components/common/ha_voice_arbiter/include/ha_voice_arbiter.h b/components/common/ha_voice_arbiter/include/ha_voice_arbiter.h
+new file mode 100644
+index 0000000..9f9ff07
+--- /dev/null
++++ b/components/common/ha_voice_arbiter/include/ha_voice_arbiter.h
+@@ -0,0 +1,101 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "esp_err.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * Microphone arbiter.
++ *
++ * The board exposes a single I2S RX path (one physical microphone). Two
++ * independent consumers need it at different times:
++ *
++ *   - "listener": the always-on WakeNet front-end (ha_voice_wake.c), which
++ *     keeps the codec open at 48 kHz / 2 ch and runs the AFE in the back.
++ *   - "capture" : a Lua recording session (voice_ptt.lua) opened on demand.
++ *
++ * The listener is the long-running owner; the capture is the short, latency
++ * sensitive owner. Rules:
++ *
++ *   - Only one of them may hold the mic at a time.
++ *   - A capture request always wins: the listener must yield within one
++ *     feed/fetch cycle, never preempt an in-flight capture.
++ *   - After a wake the listener voluntarily stays off the mic until the
++ *     capture session finishes (handoff), so the very first words are not
++ *     swallowed by the front-end.
++ *
++ * If the arbiter was never initialised all APIs degrade to "no arbitration":
++ * acquire succeeds and yield is never requested, preserving legacy behaviour.
++ */
++
++/**
++ * @brief Initialise the arbiter. Idempotent. Safe to call from any task.
++ *
++ * @return ESP_OK on success, or an error code.
++ */
++esp_err_t ha_voice_arbiter_init(void);
++
++/**
++ * @brief Capture side: request exclusive access to the microphone.
++ *
++ * Blocks up to @p timeout_ms while the listener still owns the mic. The
++ * listener notices the request on its next loop iteration and yields.
++ *
++ * @param timeout_ms Maximum time to wait.
++ * @return true if the mic is now owned by the caller, false otherwise.
++ */
++bool ha_voice_arbiter_acquire(uint32_t timeout_ms);
++
++/**
++ * @brief Capture side: release the microphone and clear any pending handoff.
++ */
++void ha_voice_arbiter_release(void);
++
++/**
++ * @brief Listener side: try to acquire the microphone for wake-word detection.
++ *
++ * Waits up to @p timeout_ms while a capture session is active or a handoff is
++ * pending. A capture session is never preempted. If a stale handoff survives
++ * the whole timeout it is dropped, so the listener can recover even if no
++ * capture session follows the wake.
++ *
++ * @param timeout_ms Maximum time to wait.
++ * @return true if the listener now owns the mic, false otherwise.
++ */
++bool ha_voice_arbiter_afe_acquire(uint32_t timeout_ms);
++
++/**
++ * @brief Listener side: release the microphone.
++ *
++ * Does not clear a pending handoff, so the listener will not immediately
++ * re-grab the mic after a wake.
++ */
++void ha_voice_arbiter_afe_release(void);
++
++/**
++ * @brief Listener side: whether a capture session wants / has the microphone.
++ *
++ * The listener polls this from its feed/fetch loop and bails out promptly when
++ * it returns true.
++ */
++bool ha_voice_arbiter_yield_requested(void);
++
++/**
++ * @brief Listener side: mark that a wake was detected and the mic is being
++ *        handed over to the capture side.
++ */
++void ha_voice_arbiter_hold_for_capture(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/components/lua_modules/lua_module_audio/CMakeLists.txt b/components/lua_modules/lua_module_audio/CMakeLists.txt
+index 8b4224d..a4d8389 100644
+--- a/components/lua_modules/lua_module_audio/CMakeLists.txt
++++ b/components/lua_modules/lua_module_audio/CMakeLists.txt
+@@ -12,6 +12,7 @@ idf_component_register(
+         esp_asrc
+         gmf_core
+         gmf_io
++        ha_voice_arbiter
+         mbedtls
+         driver
+ )
+diff --git a/components/lua_modules/lua_module_audio/src/audio_device.c b/components/lua_modules/lua_module_audio/src/audio_device.c
+index dc5306d..5f43103 100644
+--- a/components/lua_modules/lua_module_audio/src/audio_device.c
++++ b/components/lua_modules/lua_module_audio/src/audio_device.c
+@@ -5,6 +5,13 @@
+  */
+ #include "audio_private.h"
+ 
++#include "ha_voice_arbiter.h"
++
++/* The always-on WakeNet listener (ha_voice_wake.c) owns the microphone when
++ * no Lua capture is running. Opening an input device therefore waits for the
++ * listener to yield; this is the only cross-module mic mutual exclusion. */
++#define AUDIO_INPUT_ARBITER_TIMEOUT_MS 3000
++
+ bool audio_device_acquire(audio_device_t *dev)
+ {
+     if (!dev || dev->closed || dev->active) {
+@@ -66,10 +73,21 @@ static esp_err_t audio_device_open(audio_device_t *dev)
+         .channel = dev->fmt.channels,
+         .bits_per_sample = dev->fmt.bits,
+     };
++    bool arbiter_taken = false;
++    if (dev->kind == AUDIO_DEVICE_INPUT) {
++        if (!ha_voice_arbiter_acquire(AUDIO_INPUT_ARBITER_TIMEOUT_MS)) {
++            ESP_LOGW(TAG, "Input open rejected: microphone busy");
++            return ESP_FAIL;
++        }
++        arbiter_taken = true;
++    }
+     int ret = esp_codec_dev_open(dev->codec_dev, &fs);
+     if (ret != ESP_CODEC_DEV_OK) {
+         ESP_LOGE(TAG, "Codec open failed: role=%s rate=%" PRIu32 " ch=%u bits=%u ret=%d",
+                  dev->kind == AUDIO_DEVICE_OUTPUT ? "output" : "input", dev->fmt.sample_rate, dev->fmt.channels, dev->fmt.bits, ret);
++        if (arbiter_taken) {
++            ha_voice_arbiter_release();
++        }
+         return ESP_FAIL;
+     }
+     audio_device_refresh_actual_format(dev);
+@@ -81,6 +99,9 @@ static esp_err_t audio_device_open(audio_device_t *dev)
+     if (ret != ESP_CODEC_DEV_OK && ret != ESP_CODEC_DEV_NOT_SUPPORT) {
+         ESP_LOGE(TAG, "Codec level setup failed: role=%s ret=%d", dev->kind == AUDIO_DEVICE_OUTPUT ? "output" : "input", ret);
+         esp_codec_dev_close(dev->codec_dev);
++        if (arbiter_taken) {
++            ha_voice_arbiter_release();
++        }
+         return ESP_FAIL;
+     }
+     dev->closed = false;
+@@ -142,6 +163,9 @@ int lua_audio_device_close(lua_State *L)
+     if (esp_codec_dev_close(dev->codec_dev) != ESP_CODEC_DEV_OK) {
+         ESP_LOGW(TAG, "Codec close returned error");
+     }
++    if (dev->kind == AUDIO_DEVICE_INPUT) {
++        ha_voice_arbiter_release();
++    }
+     dev->codec_dev = NULL;
+     dev->closed = true;
+     lua_pushboolean(L, 1);
+@@ -153,6 +177,9 @@ int lua_audio_device_gc(lua_State *L)
+     audio_device_t *dev = (audio_device_t *)lua_touserdata(L, 1);
+     if (dev && !dev->closed && dev->holders == 0 && !dev->active) {
+         esp_codec_dev_close(dev->codec_dev);
++        if (dev->kind == AUDIO_DEVICE_INPUT) {
++            ha_voice_arbiter_release();
++        }
+         dev->codec_dev = NULL;
+         dev->closed = true;
+     }

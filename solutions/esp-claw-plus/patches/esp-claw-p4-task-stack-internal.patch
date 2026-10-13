@@ -1,0 +1,49 @@
+diff --git a/application/edge_agent/sdkconfig.defaults.esp32p4 b/application/edge_agent/sdkconfig.defaults.esp32p4
+index 05300a5..169561c 100644
+--- a/application/edge_agent/sdkconfig.defaults.esp32p4
++++ b/application/edge_agent/sdkconfig.defaults.esp32p4
+@@ -3,3 +3,23 @@
+ #
+ CONFIG_BT_ENABLED=n
+ CONFIG_APP_CLAW_LUA_MODULE_BLE_HID=n
++
++#
++# ESP32-P4: flash 与 PSRAM 共享 MSPI。flash 事务 (FATFS/VFS 写入、擦除) 期间 cache
++# 被关闭，PSRAM 中的任务栈随即不可访问，任何栈落在 PSRAM 的任务执行此类操作都会在
++# spi_flash_disable_interrupts_caches_and_other_cpu() 内 assert (cache_utils.c:114)。
++# 关掉外部内存任务栈，强制 FreeRTOS 任务栈走内部 RAM；claw 的
++# CLAW_TASK_STACK_PREFER_PSRAM 任务 (session mgr / agent worker / lua…) 随之回退，
++# mDNS 任务同样回到内部 RAM。
++#
++# 注意: 板级 sdkconfig.defaults.board 无法覆盖项目默认值 (项目默认值后加载且优先),
++#       故此项必须写在项目侧的目标默认文件 sdkconfig.defaults.esp32p4 中。
++#
++CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=n
++CONFIG_MDNS_TASK_CREATE_FROM_INTERNAL=y
++
++#
++# 火山流式语音识别 2.0 (bigmodel_async) 的 WebSocket 101 响应头约 1.2KB, 超过 tcp_transport
++# 默认 WS_BUFFER_SIZE(1024): 握手响应读不进缓冲区会导致 ws_connect 失败并报
++# "Error read response for Upgrade header"。放大握手缓冲区以容纳完整响应头。
++#
++CONFIG_WS_BUFFER_SIZE=4096
+
+diff --git a/components/common/emote/emote.c b/components/common/emote/emote.c
+index 311f0b6..9891db0 100644
+--- a/components/common/emote/emote.c
++++ b/components/common/emote/emote.c
+@@ -144,11 +144,10 @@ static emote_config_t emote_get_default_config(void)
+             .task_priority = 3,
+             .task_stack = 12 * 1024,
+             .task_affinity = -1,
+-#ifdef CONFIG_SPIRAM_XIP_FROM_PSRAM
+-            .task_stack_in_ext = true,
+-#else
++            /* P4: flash/PSRAM 共享 MSPI, 且 CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=n 时
++             * 外部内存任务栈会在 xTaskCreateStaticPinnedToCore 内 assert; 即便
++             * CONFIG_SPIRAM_XIP_FROM_PSRAM 开启也强制 emote 任务栈走内部 RAM。 */
+             .task_stack_in_ext = false,
+-#endif
+         },
+         .flush_cb = emote_flush_callback,
+         .update_cb = emote_update_callback,

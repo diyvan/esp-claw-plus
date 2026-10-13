@@ -1,0 +1,126 @@
+--- a/application/edge_agent/components/app_config/include/app_config.h
++++ b/application/edge_agent/components/app_config/include/app_config.h
+@@ -54,8 +54,20 @@
+     char llm_visible_cap_groups[APP_CONFIG_STR_LEN];
+     char enabled_lua_modules[APP_CONFIG_STR_LEN];
+     char time_timezone[APP_CONFIG_TIMEZONE_LEN];
++    char ha_enabled[8];
+     char ha_base_url[APP_CONFIG_STR_LEN];
+     char ha_token[APP_CONFIG_STR_LEN];
++    char voice_enabled[8];
++    char voice_wake_enabled[8];
++    char voice_asr_url[APP_CONFIG_STR_LEN];
++    char voice_asr_api_key[APP_CONFIG_STR_LEN];
++    char voice_tts_url[APP_CONFIG_STR_LEN];
++    char voice_tts_api_key[APP_CONFIG_STR_LEN];
++    char voice_asr_provider[32];
++    char voice_asr_resource_id[64];
++    char voice_tts_provider[32];
++    char voice_tts_resource_id[64];
++    char voice_tts_speaker[64];
+ } app_config_t;
+ 
+ esp_err_t app_config_init(void);
+--- a/application/edge_agent/components/app_config/app_config.c
++++ b/application/edge_agent/components/app_config/app_config.c
+@@ -61,8 +61,20 @@
+ #define APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS   ""
+ #define APP_DEFAULT_ENABLED_LUA_MODULES      ""
+ #define APP_DEFAULT_TIME_TIMEZONE            "CST-8"
++#define APP_DEFAULT_HA_ENABLED               "true"
+ #define APP_DEFAULT_HA_BASE_URL              ""
+ #define APP_DEFAULT_HA_TOKEN                 ""
++#define APP_DEFAULT_VOICE_ENABLED            "true"
++#define APP_DEFAULT_VOICE_WAKE_ENABLED       "true"
++#define APP_DEFAULT_VOICE_ASR_URL            ""
++#define APP_DEFAULT_VOICE_ASR_API_KEY        ""
++#define APP_DEFAULT_VOICE_TTS_URL            ""
++#define APP_DEFAULT_VOICE_TTS_API_KEY        ""
++#define APP_DEFAULT_VOICE_ASR_PROVIDER       ""
++#define APP_DEFAULT_VOICE_ASR_RESOURCE_ID    ""
++#define APP_DEFAULT_VOICE_TTS_PROVIDER       ""
++#define APP_DEFAULT_VOICE_TTS_RESOURCE_ID    ""
++#define APP_DEFAULT_VOICE_TTS_SPEAKER        ""
+
+ static const app_config_field_t s_fields[] = {
+     APP_CONFIG_FIELD(wifi_ssid, "wifi_ssid", APP_WIFI_SSID),
+@@ -99,8 +111,20 @@
+     APP_CONFIG_FIELD(llm_visible_cap_groups, "vis_cap_groups", APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS),
+     APP_CONFIG_FIELD(enabled_lua_modules, "en_lua_mods", APP_DEFAULT_ENABLED_LUA_MODULES),
+     APP_CONFIG_FIELD(time_timezone, "time_timezone", APP_DEFAULT_TIME_TIMEZONE),
++    APP_CONFIG_FIELD(ha_enabled, "ha_enabled", APP_DEFAULT_HA_ENABLED),
+     APP_CONFIG_FIELD(ha_base_url, "ha_base_url", APP_DEFAULT_HA_BASE_URL),
+     APP_CONFIG_FIELD(ha_token, "ha_token", APP_DEFAULT_HA_TOKEN),
++    APP_CONFIG_FIELD(voice_enabled, "voice_enabled", APP_DEFAULT_VOICE_ENABLED),
++    APP_CONFIG_FIELD(voice_wake_enabled, "voice_wake_en", APP_DEFAULT_VOICE_WAKE_ENABLED),
++    APP_CONFIG_FIELD(voice_asr_url, "voice_asr_url", APP_DEFAULT_VOICE_ASR_URL),
++    APP_CONFIG_FIELD(voice_asr_api_key, "voice_asr_key", APP_DEFAULT_VOICE_ASR_API_KEY),
++    APP_CONFIG_FIELD(voice_tts_url, "voice_tts_url", APP_DEFAULT_VOICE_TTS_URL),
++    APP_CONFIG_FIELD(voice_tts_api_key, "voice_tts_key", APP_DEFAULT_VOICE_TTS_API_KEY),
++    APP_CONFIG_FIELD(voice_asr_provider, "voice_asr_prov", APP_DEFAULT_VOICE_ASR_PROVIDER),
++    APP_CONFIG_FIELD(voice_asr_resource_id, "voice_asr_res", APP_DEFAULT_VOICE_ASR_RESOURCE_ID),
++    APP_CONFIG_FIELD(voice_tts_provider, "voice_tts_prov", APP_DEFAULT_VOICE_TTS_PROVIDER),
++    APP_CONFIG_FIELD(voice_tts_resource_id, "voice_tts_res", APP_DEFAULT_VOICE_TTS_RESOURCE_ID),
++    APP_CONFIG_FIELD(voice_tts_speaker, "voice_tts_spk", APP_DEFAULT_VOICE_TTS_SPEAKER),
+ };
+ 
+ // for backward compatibility, migrate from old settings to new settings
+--- a/application/edge_agent/components/http_server/http_server_config_api.c
++++ b/application/edge_agent/components/http_server/http_server_config_api.c
+@@ -77,8 +77,21 @@
+ 
+     CONFIG_FIELD("time",         time_timezone),
+ 
++    CONFIG_FIELD("ha",           ha_enabled),
+     CONFIG_FIELD("ha",           ha_base_url),
+     CONFIG_FIELD("ha",           ha_token),
++
++    CONFIG_FIELD("voice",        voice_enabled),
++    CONFIG_FIELD("voice",        voice_wake_enabled),
++    CONFIG_FIELD("voice",        voice_asr_url),
++    CONFIG_FIELD("voice",        voice_asr_api_key),
++    CONFIG_FIELD("voice",        voice_tts_url),
++    CONFIG_FIELD("voice",        voice_tts_api_key),
++    CONFIG_FIELD("voice",        voice_asr_provider),
++    CONFIG_FIELD("voice",        voice_asr_resource_id),
++    CONFIG_FIELD("voice",        voice_tts_provider),
++    CONFIG_FIELD("voice",        voice_tts_resource_id),
++    CONFIG_FIELD("voice",        voice_tts_speaker),
+ };
+ 
+ static const size_t CONFIG_FIELD_COUNT = sizeof(CONFIG_FIELDS) / sizeof(CONFIG_FIELDS[0]);
+@@ -340,13 +353,16 @@
+         }
+         if ((strcmp(field->name, "llm_supports_tools") == 0 ||
+                 strcmp(field->name, "llm_supports_vision") == 0 ||
+-                strcmp(field->name, "llm_image_remote_url_only") == 0) &&
++                strcmp(field->name, "llm_image_remote_url_only") == 0 ||
++                strcmp(field->name, "ha_enabled") == 0 ||
++                strcmp(field->name, "voice_enabled") == 0 ||
++                strcmp(field->name, "voice_wake_enabled") == 0) &&
+                 !is_boolean_string(item->valuestring)) {
+             cJSON_Delete(root);
+             free(config);
+             return httpd_resp_send_err(req,
+                                        HTTPD_400_BAD_REQUEST,
+-                                       "LLM boolean fields must be true/false");
++                                       "Boolean fields must be true/false");
+         }
+         strlcpy(field_mutable(config, field), item->valuestring, field->size);
+         applied_count++;
+--- a/application/edge_agent/main/main.c
++++ b/application/edge_agent/main/main.c
+@@ -125,6 +125,13 @@
+     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+         ESP_LOGW(TAG, "Failed to update running Claw config: %s", esp_err_to_name(err));
+     }
++
++    /* Republish the HA/voice runtime config so the voice Lua skills and the
++     * on-device info page pick up the new values without a reboot. */
++    esp_err_t pub_err = ha_panel_publish_runtime_config();
++    if (pub_err != ESP_OK && pub_err != ESP_ERR_INVALID_STATE) {
++        ESP_LOGW(TAG, "Failed to publish runtime config: %s", esp_err_to_name(pub_err));
++    }
+     return ESP_OK;
+ }
+ 

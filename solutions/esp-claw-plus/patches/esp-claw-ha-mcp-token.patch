@@ -1,0 +1,138 @@
+diff --git a/components/claw_capabilities/cap_mcp_client/src/cap_mcp_client.c b/components/claw_capabilities/cap_mcp_client/src/cap_mcp_client.c
+index 9d92ca8..31df52f 100644
+--- a/components/claw_capabilities/cap_mcp_client/src/cap_mcp_client.c
++++ b/components/claw_capabilities/cap_mcp_client/src/cap_mcp_client.c
+@@ -230,7 +230,7 @@ static const claw_cap_descriptor_t s_mcp_client_descriptors[] = {
+         .kind = CLAW_CAP_KIND_CALLABLE,
+         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+         .input_schema_json =
+-        "{\"type\":\"object\",\"properties\":{\"server_url\":{\"type\":\"string\"},\"endpoint\":{\"type\":\"string\"},\"cursor\":{\"type\":\"string\"}},\"required\":[\"server_url\"]}",
++        "{\"type\":\"object\",\"properties\":{\"server_url\":{\"type\":\"string\"},\"endpoint\":{\"type\":\"string\"},\"cursor\":{\"type\":\"string\"},\"bearer_token\":{\"type\":\"string\"}},\"required\":[\"server_url\"]}",
+         .execute = cap_mcp_list_execute,
+     },
+     {
+@@ -241,7 +241,7 @@ static const claw_cap_descriptor_t s_mcp_client_descriptors[] = {
+         .kind = CLAW_CAP_KIND_CALLABLE,
+         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+         .input_schema_json =
+-        "{\"type\":\"object\",\"properties\":{\"server_url\":{\"type\":\"string\"},\"endpoint\":{\"type\":\"string\"},\"tool_name\":{\"type\":\"string\"},\"arguments\":{\"type\":\"object\"}},\"required\":[\"server_url\",\"tool_name\"]}",
++        "{\"type\":\"object\",\"properties\":{\"server_url\":{\"type\":\"string\"},\"endpoint\":{\"type\":\"string\"},\"tool_name\":{\"type\":\"string\"},\"arguments\":{\"type\":\"object\"},\"bearer_token\":{\"type\":\"string\"}},\"required\":[\"server_url\",\"tool_name\"]}",
+         .execute = cap_mcp_call_execute,
+     },
+     {
+diff --git a/components/claw_capabilities/cap_mcp_client/src/cap_mcp_client_core.c b/components/claw_capabilities/cap_mcp_client/src/cap_mcp_client_core.c
+index 2a3d0fa..929c7c3 100644
+--- a/components/claw_capabilities/cap_mcp_client/src/cap_mcp_client_core.c
++++ b/components/claw_capabilities/cap_mcp_client/src/cap_mcp_client_core.c
+@@ -6,6 +6,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#include "esp_log.h"
+ #include "esp_http_client.h"
+ #include "esp_mcp_mgr.h"
+ 
+@@ -27,7 +28,9 @@ static esp_err_t cap_mcp_parse_common_input(const char *input_json,
+                                             size_t cursor_buf_size,
+                                             char *tool_name_buf,
+                                             size_t tool_name_buf_size,
+-                                            cJSON **arguments_out)
++                                            cJSON **arguments_out,
++                                            char *bearer_buf,
++                                            size_t bearer_buf_size)
+ {
+     cJSON *input = cJSON_Parse(input_json);
+ 
+@@ -85,6 +88,15 @@ static esp_err_t cap_mcp_parse_common_input(const char *input_json,
+         }
+     }
+ 
++    if (bearer_buf && bearer_buf_size > 0) {
++        cJSON *bearer_item = cJSON_GetObjectItem(input, "bearer_token");
++
++        bearer_buf[0] = '\0';
++        if (cJSON_IsString(bearer_item) && bearer_item->valuestring[0]) {
++            strlcpy(bearer_buf, bearer_item->valuestring, bearer_buf_size);
++        }
++    }
++
+     cJSON_Delete(input);
+     return ESP_OK;
+ }
+@@ -164,6 +176,7 @@ static esp_err_t cap_mcp_init_remote_session(esp_mcp_mgr_handle_t mgr, const cha
+ 
+ static esp_err_t cap_mcp_mgr_create(const char *server_url,
+                                     const char *endpoint,
++                                    const char *bearer_token,
+                                     esp_mcp_mgr_handle_t *mgr_out)
+ {
+     esp_err_t err;
+@@ -203,6 +216,15 @@ static esp_err_t cap_mcp_mgr_create(const char *server_url,
+         return err;
+     }
+ 
++    /* Optional bearer token (e.g. Home Assistant long-lived access token):
++     * applied to the built-in HTTP transport before the initialize handshake. */
++    if (bearer_token && bearer_token[0]) {
++        err = esp_mcp_mgr_set_bearer_token(*mgr_out, bearer_token);
++        if (err != ESP_OK) {
++            ESP_LOGW("cap_mcp_client", "set bearer token failed: %s", esp_err_to_name(err));
++        }
++    }
++
+     err = cap_mcp_init_remote_session(*mgr_out, endpoint);
+     if (err != ESP_OK) {
+         esp_mcp_mgr_stop(*mgr_out);
+@@ -244,6 +266,7 @@ esp_err_t cap_mcp_list_remote_tools(const char *input_json, cJSON **result_out)
+     char server_url_buf[256];
+     char endpoint_buf[64];
+     char cursor_buf[128];
++    char bearer_buf[512];
+     esp_mcp_mgr_handle_t mgr = 0;
+     cap_mcp_response_ctx_t ctx = {0};
+     esp_mcp_mgr_req_t req = {0};
+@@ -263,12 +286,14 @@ esp_err_t cap_mcp_list_remote_tools(const char *input_json, cJSON **result_out)
+                                      sizeof(cursor_buf),
+                                      NULL,
+                                      0,
+-                                     NULL);
++                                     NULL,
++                                     bearer_buf,
++                                     sizeof(bearer_buf));
+     if (err != ESP_OK) {
+         return err;
+     }
+ 
+-    err = cap_mcp_mgr_create(server_url_buf, endpoint_buf, &mgr);
++    err = cap_mcp_mgr_create(server_url_buf, endpoint_buf, bearer_buf, &mgr);
+     if (err != ESP_OK) {
+         return err;
+     }
+@@ -293,6 +318,7 @@ esp_err_t cap_mcp_call_remote_tool(const char *input_json, cJSON **result_out)
+     char server_url_buf[256];
+     char endpoint_buf[64];
+     char tool_name_buf[128];
++    char bearer_buf[512];
+     cJSON *arguments = NULL;
+     char *arguments_json = NULL;
+     esp_mcp_mgr_handle_t mgr = 0;
+@@ -314,7 +340,9 @@ esp_err_t cap_mcp_call_remote_tool(const char *input_json, cJSON **result_out)
+                                      0,
+                                      tool_name_buf,
+                                      sizeof(tool_name_buf),
+-                                     &arguments);
++                                     &arguments,
++                                     bearer_buf,
++                                     sizeof(bearer_buf));
+     if (err != ESP_OK) {
+         cJSON_Delete(arguments);
+         return err;
+@@ -326,7 +354,7 @@ esp_err_t cap_mcp_call_remote_tool(const char *input_json, cJSON **result_out)
+         return ESP_ERR_NO_MEM;
+     }
+ 
+-    err = cap_mcp_mgr_create(server_url_buf, endpoint_buf, &mgr);
++    err = cap_mcp_mgr_create(server_url_buf, endpoint_buf, bearer_buf, &mgr);
+     if (err != ESP_OK) {
+         cJSON_free(arguments_json);
+         return err;

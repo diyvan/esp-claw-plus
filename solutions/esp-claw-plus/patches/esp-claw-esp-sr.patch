@@ -1,0 +1,36 @@
+diff --git a/application/edge_agent/main/idf_component.yml b/application/edge_agent/main/idf_component.yml
+index 9e601f2..8220164 100644
+--- a/application/edge_agent/main/idf_component.yml
++++ b/application/edge_agent/main/idf_component.yml
+@@ -12,6 +12,10 @@ dependencies:
+     rules:
+       - if: "target in [esp32p4]"
+ 
++  # esp-sr: 本地唤醒词 (WakeNet) + AFE。注册表 2.4.4 起已适配 IDF v6 (>=5.0 + cjson)。
++  espressif/esp-sr:
++    version: "^2.4.4"
++
+   espressif2022/esp_emote_expression:
+     version: "^1.0.0"
+ 
+diff --git a/application/edge_agent/partitions_16MB.csv b/application/edge_agent/partitions_16MB.csv
+index 01acfd6..178dd8a 100644
+--- a/application/edge_agent/partitions_16MB.csv
++++ b/application/edge_agent/partitions_16MB.csv
+@@ -2,8 +2,12 @@
+ nvs,       data, nvs,     0xA000,   0x6000
+ otadata,   data, ota,     0x10000,  0x2000
+ phy_init,  data, phy,     0x12000,  0x1000
+-ota_0,     app,  ota_0,         ,   4M
+-ota_1,     app,  ota_1,         ,   4M
++ota_0,     app,  ota_0,         ,   0x440000
++ota_1,     app,  ota_1,         ,   0x440000
+ emote,     data, spiffs,        ,   3M
+-system,    data, fat,           ,   1M
+-storage,   data, fat,           ,   3M
++# system 分区 1M->1.5M: skills/scripts 小文件极多, 4KB 簇取整浪费会把 1M 撑爆
++# (fatfsgen NoFreeCluster); 代价: ota_0/ota_1 4.5M->4.25M (app 当前约 4.13MB)。
++system,    data, fat,           ,   0x180000
++storage,   data, fat,           ,   2M
++# esp-sr 唤醒词/AFE 模型分区 (label 必须为 model)。填入末尾空闲 896KB。
++model,     data, spiffs,        ,   0xE0000
