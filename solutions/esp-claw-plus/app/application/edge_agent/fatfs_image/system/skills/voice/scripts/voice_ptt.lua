@@ -24,6 +24,7 @@ local json = require("json")
 local capability = require("capability")
 local tts = require("voice_tts")
 local vc = require("voice_common")
+local vstream = require("voice_stream")
 
 local TAG = "[voice_ptt]"
 
@@ -59,13 +60,14 @@ local FINISH_TIMEOUT_MS = 6000 -- 流式 ASR: 收尾发末包后等待最终结�
 -- 语音会话所在渠道/会话, 必须与路由规则 voice_reply_run_script 的匹配条件一致
 local VOICE_CHANNEL = "voice"
 local VOICE_CHAT_ID = "voice"
+-- direct 回复模式的语音会话 id: 路由规则据此打 direct flag (跳过工具/长期记忆, 单轮直答),
+-- 见 docs/adr/0001-voice-reply-mode.md。模式由设备语音页开关或网页写入运行 JSON。
+local VOICE_CHAT_ID_DIRECT = "voice_llm"
 
--- 流式回复文件: C 侧 (claw_core_agent_loop.c) 在 voice 轮次把 LLM 增量文本追加到该文件,
--- 结束时写入 STREAM_END_MARKER。本脚本按句切分逐句合成播报 (句子级流水线), 从而在 LLM
--- 尚未生成完整回复前就开始 TTS。此种情况下 C 侧不再发布 out_message, voice_reply.lua
--- 不会被触发, 播放由本脚本负责。
-local STREAM_FILE = "voice_stream.txt"
-local STREAM_END_MARKER = "\1\1" .. "END" .. "\1\1"
+-- 流式回复文件桥 (文件名 / 结束哨兵 / 整读差分 / 按标点切句) 由 voice_stream 统一承载, 见该
+-- 模块。本脚本在此之上只做「逐句同步合成 + 异步播放」的流水线, 从而在 LLM 尚未生成完整回复
+-- 前就开始 TTS。此种情况下 C 侧不再发布 out_message, voice_reply.lua 不会被触发, 播放由
+-- 本脚本负责。
 
 -- 屏幕桥 (voice_status.txt / voice_user.txt / voice_agent.txt 的读写) 统一由 voice_common
 -- 承载, 见 SKILL.md「屏幕桥」一节。此处仅保留面板状态机逻辑。
@@ -137,13 +139,17 @@ end
 -- 正在播放 TTS 的 voice_reply.lua 轮询到该标志即 player:stop()。跨脚本唯一可行的信道是
 -- 文件 (/fatfs), 由 voice_common 统一承载, 详见 voice_common.lua。
 
--- [边收边播开关] 存储根目录存在该标记文件时, 每句回复以 TTS 流式边收边解码边播放
--- (player:play_stream), 不再整句合成落盘。默认关闭 (零回归): 与 wake_trigger / voice_interrupt
--- 一样用 /fatfs 文件做跨脚本开关, 在设备「文件」页新建一个空文件 voice_tts_stream 即启用。
-local STREAM_FLAG = "voice_tts_stream"
-
+-- [边收边播开关] 运行时配置 voice_tts_stream=true 时, 每句回复以 TTS 流式边收边解码边播放
+-- (player:play_stream), 不再整句合成落盘。默认 false (零回归): 与其它语音开关一致存 NVS,
+-- 在网页面板「语音助手」页切换, 经 /fatfs/ha_voice_runtime.json 下发 (见 voice-integration.md §7)。
 local function stream_enabled()
-    return storage.exists(storage.join_path(storage.get_root_dir(), STREAM_FLAG))
+    local cfg = vc.runtime_config()
+    -- 本地 TTS 引擎没有落盘路径, 只能流式合成+播放, 故强制开启。
+    if tts.is_local(cfg) then
+        return true
+    end
+    local value = cfg.voice_tts_stream
+    return value == true or value == "true"
 end
 
 -- ---------------------------------------------------------------------------
@@ -152,7 +158,8 @@ end
 -- 字段: voice_enabled / voice_wake_enabled / voice_asr_url / voice_asr_api_key /
 --       voice_asr_provider / voice_asr_resource_id /
 --       voice_tts_url / voice_tts_api_key / voice_tts_provider /
---       voice_tts_resource_id / voice_tts_speaker / ha_enabled / ha_base_url / ha_token
+--       voice_tts_resource_id / voice_tts_speaker / voice_reply_mode /
+--       voice_tts_stream / ha_enabled / ha_base_url / ha_token
 -- 说明: voice_enabled 是语音助手总开关, 关闭后 PTT 与唤醒词都停用。
 -- ---------------------------------------------------------------------------
 
@@ -167,6 +174,14 @@ end
 -- 语音助手总开关 (voice_enabled): 关闭后 PTT 与唤醒词都停用, 面板也会隐藏语音页。
 local function voice_assistant_enabled()
     return cfg_is_true(vc.runtime_config().voice_enabled, true)
+end
+
+-- 本轮注入所用的 chat_id: direct 模式走 voice_llm (单轮直答), 其余走 voice (完整 Agent)。
+local function reply_chat_id()
+    if vc.runtime_config().voice_reply_mode == "direct" then
+        return VOICE_CHAT_ID_DIRECT
+    end
+    return VOICE_CHAT_ID
 end
 
 -- 估算一小段 16-bit 小端交织 PCM 的 RMS (每 4 帧取 1 帧, 限制 CPU 开销)。
@@ -405,13 +420,14 @@ end
 
 
 local function inject_text(text)
+    local chat_id = reply_chat_id()
     ep.publish_message({
         source_cap = "lua_script",
         channel = VOICE_CHANNEL,
-        chat_id = VOICE_CHAT_ID,
+        chat_id = chat_id,
         text = text,
     })
-    print(TAG .. " injected into agent: " .. text)
+    print(TAG .. " injected into agent [" .. chat_id .. "]: " .. text)
 end
 
 -- ---------------------------------------------------------------------------
@@ -422,78 +438,34 @@ local release_requested = false
 local rec = nil               -- { input, info, chunks, bytes, start_ms }
 
 -- ---------------------------------------------------------------------------
--- 句子级流式播报 (voice_stream.txt 消费端)
+-- 句子级流式播报 (经 voice_stream 消费 /fatfs/voice_stream.txt)
 --
--- 注入用户文本后进入 "waiting": 轮询 /fatfs/voice_stream.txt, 每凑齐一句就同步合成 +
--- 异步播放, 边生成边播报。若本轮没有流式内容 (C 侧回退或模型直接走非流式), 文件只含
--- 结束标记 -> 交回 voice_reply.lua 的普通路径播放, 本脚本不重复播报。
+-- 注入用户文本后进入 "waiting": 轮询流式文件, 每凑齐一句就同步合成 + 异步播放, 边生成
+-- 边播报。若本轮没有流式内容 (C 侧回退或模型直接走非流式), 文件只含结束标记 -> 交回
+-- voice_reply.lua 的普通路径播放, 本脚本不重复播报。
 -- ---------------------------------------------------------------------------
 local WAIT_POLL_MS = 20            -- 等待态轮询间隔
-local SOFT_SPLIT_MAX = 40          -- 无强标点时超过此长度即在软标点处切句, 限制首句延迟
-local STRONG_TERM = {}             -- 强终止符: 命中立即断句
-for _, ch in ipairs({ "。", "！", "？", "!", "?", "；", ";", "\n" }) do
-    STRONG_TERM[ch] = true
-end
-local SOFT_TERM = { ["，"] = true, [","] = true, ["、"] = true, ["："] = true, [":"] = true }
 
-local reply_wait = nil             -- { consumed, buf, queue, ended, player, output, played, deadline, tts_cfg }
-
-local function stream_path()
-    return storage.join_path(storage.get_root_dir(), STREAM_FILE)
-end
-
-
--- 读取流式文件: 返回 (可见文本, 是否已结束)。文本不含结束标记; 只出现控制字节 \1\1
--- 也视为未写完的标记, 一并剔除。
-local function read_stream()
-    local path = stream_path()
-    if not storage.exists(path) then
-        return "", false
-    end
-    local ok, content = pcall(storage.read_file, path)
-    if not ok or type(content) ~= "string" then
-        return "", false
-    end
-    local p = content:find("\1\1", 1, true)
-    if p then
-        local tail = content:sub(p, p + #STREAM_END_MARKER - 1)
-        return content:sub(1, p - 1), tail == STREAM_END_MARKER
-    end
-    return content, false
-end
+local reply_wait = nil             -- { stream, queue, player, output, played, deadline, tts_cfg }
 
 local function trim(s)
     return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
--- 从缓冲取一句: 优先强终止符; 无强标点且已很长时在最后一个软标点处切; flush 时返回全部。
-local function next_sentence(buf, flush)
-    if buf == "" then
-        return nil, buf
-    end
-    for i = 1, #buf do
-        if STRONG_TERM[buf:sub(i, i)] then
-            return buf:sub(1, i), buf:sub(i + 1)
-        end
-    end
-    if #buf >= SOFT_SPLIT_MAX then
-        for i = #buf, 1, -1 do
-            if SOFT_TERM[buf:sub(i, i)] then
-                return buf:sub(1, i), buf:sub(i + 1)
-            end
-        end
-    end
-    if flush then
-        return buf, ""
-    end
-    return nil, buf
-end
-
 -- 边收边播一句: 向 provider 要流式请求描述, 交给 player:play_stream() 直接边收边解码边播放。
+-- 首句用 play_stream() 建立分句流水线; 后续句用 play_stream_append() 追加到同一会话
+-- (底层同一环形缓冲, 音频首尾相接, 句间无静音断层)。
 -- 返回 true 表示已递交流式播放; false 表示不支持/失败, 调用方回退到落盘路径。
 local function play_sentence_stream(sentence)
     local req = tts.stream_request(reply_wait.tts_cfg, sentence)
     if not req then
+        return false
+    end
+    if reply_wait.stream_started and reply_wait.player then
+        if reply_wait.player:play_stream_append(req) then
+            return true
+        end
+        print(TAG .. " play_stream_append failed")
         return false
     end
     if not reply_wait.player then
@@ -504,6 +476,7 @@ local function play_sentence_stream(sentence)
     end
     vc.clear_interrupt()
     if reply_wait.player:play_stream(req) then
+        reply_wait.stream_started = true
         reply_wait.played = true
         set_status("speaking")
         return true
@@ -518,8 +491,15 @@ local function play_sentence(sentence)
     if sentence == "" or not reply_wait.output then
         return
     end
-    if reply_wait.stream_enabled and play_sentence_stream(sentence) then
-        return
+    if reply_wait.stream_enabled then
+        if play_sentence_stream(sentence) then
+            return
+        end
+        if reply_wait.stream_started then
+            -- 流水线已建立却追加失败: 不混用落盘播放 (会打断在途音频), 丢弃该句。
+            print(TAG .. " stream pipeline append failed, dropping sentence")
+            return
+        end
     end
     local path = tts.synthesize(reply_wait.tts_cfg, sentence, "voice_reply", storage.get_root_dir())
     if not path then
@@ -575,19 +555,27 @@ end
 -- 会话记录不清: 助手回复由 log_agent_append 在切出首句时新建一条 A, 与历史共存。
 local function arm_reply_wait()
     abort_reply_wait()
-    pcall(storage.remove, stream_path())
+    local root_dir = storage.get_root_dir()
+    vstream.reset(root_dir)
 
     local wait = {
-        consumed = 0, buf = "", queue = {}, ended = false,
+        stream = vstream.consumer({ root_dir = root_dir }),
+        queue = {},
         player = nil, output = nil, played = false,
         stream_enabled = stream_enabled(),
+        stream_started = false,     -- 首句已建立分句流水线会话
+        finish_sent = false,        -- 已通知流水线不再追加
+        t_inject = system.millis(),
+        first_sentence_ms = nil,
+        first_play_ms = nil,
         deadline = system.millis() + REPLY_TIMEOUT_MS,
         tts_cfg = vc.runtime_config(),
     }
 
     local codec, rate, channels, bits = bm.get_audio_codec_output_params("audio_dac")
     if codec then
-        wait.output = audio.new_output({ codec, rate, channels, bits, volume = 80 })
+        wait.output = audio.new_output({ codec, rate, channels, bits,
+            volume = tonumber(wait.tts_cfg and wait.tts_cfg.voice_volume) or 80 })
     end
     if wait.output then
         wait.player = audio.player({ output = wait.output })
@@ -620,6 +608,8 @@ local function wait_step()
         if not player_running then
             reply_wait.player:close()
             reply_wait.player = nil
+            -- 流式会话随 player 一并结束: 若后续还有句子需重新起播 (会重新建会话)。
+            reply_wait.stream_started = false
         elseif vc.interrupt_requested() then
             print(TAG .. " barge-in during stream playback -> stop")
             vc.clear_interrupt()
@@ -629,31 +619,42 @@ local function wait_step()
         end
     end
 
-    if not reply_wait.ended then
-        local text, ended = read_stream()
-        if #text > reply_wait.consumed then
-            reply_wait.buf = reply_wait.buf .. text:sub(reply_wait.consumed + 1)
-            reply_wait.consumed = #text
-        end
-        local sentence
-        repeat
-            sentence, reply_wait.buf = next_sentence(reply_wait.buf, ended)
-            if sentence then
-                vc.log_agent_append(sentence)
-                reply_wait.queue[#reply_wait.queue + 1] = sentence
+    repeat
+        local sentence = reply_wait.stream:next()
+        if sentence then
+            if not reply_wait.first_sentence_ms then
+                reply_wait.first_sentence_ms = system.millis() - reply_wait.t_inject
+                print(string.format("%s timing: first_sentence=%dms",
+                    TAG, reply_wait.first_sentence_ms))
             end
-        until not sentence
-        if ended then
-            reply_wait.ended = true
+            vc.log_agent_append(sentence)
+            reply_wait.queue[#reply_wait.queue + 1] = sentence
         end
-    end
+    until not sentence
 
-    -- 流式模式下一句必须等上一句播完 (cap_tts_stream 为单会话, 会打断在途音频)。
-    if #reply_wait.queue > 0 and not (reply_wait.stream_enabled and player_running) then
+    if reply_wait.stream_enabled then
+        -- 流式模式: 每切出一句立刻追加进同一条 TTS 流水线, 音频在底层环形缓冲中首尾相接,
+        -- 句间无静音断层, 因此不再需要等上一句播完再起下一句。
+        while #reply_wait.queue > 0 do
+            play_sentence(table.remove(reply_wait.queue, 1))
+        end
+        -- 文本已全部切句完毕: 通知流水线不再追加, 队列排空后自然收尾。
+        if reply_wait.stream:finished() and reply_wait.stream_started
+           and not reply_wait.finish_sent and reply_wait.player then
+            reply_wait.player:play_stream_finish()
+            reply_wait.finish_sent = true
+        end
+    elseif #reply_wait.queue > 0 and not player_running then
+        -- 非流式模式: 逐句落盘播放, 一次只起一句, 等它播完再起下一句。
         play_sentence(table.remove(reply_wait.queue, 1))
     end
 
-    if reply_wait.ended and not reply_wait.player and #reply_wait.queue == 0 then
+    if not reply_wait.first_play_ms and reply_wait.played then
+        reply_wait.first_play_ms = system.millis() - reply_wait.t_inject
+        print(string.format("%s timing: first_play=%dms", TAG, reply_wait.first_play_ms))
+    end
+
+    if reply_wait.stream:finished() and not reply_wait.player and #reply_wait.queue == 0 then
         end_reply_wait()
         return
     end

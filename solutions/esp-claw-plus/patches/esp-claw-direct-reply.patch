@@ -1,0 +1,257 @@
+diff --git a/application/edge_agent/components/app_config/app_config.c b/application/edge_agent/components/app_config/app_config.c
+index 4be7c77..fc55201 100644
+--- a/application/edge_agent/components/app_config/app_config.c
++++ b/application/edge_agent/components/app_config/app_config.c
+@@ -76,6 +76,7 @@ typedef struct {
+ #define APP_DEFAULT_VOICE_TTS_RESOURCE_ID    ""
+ #define APP_DEFAULT_VOICE_TTS_SPEAKER        ""
+ #define APP_DEFAULT_VOICE_VOLUME             "80"
++#define APP_DEFAULT_VOICE_REPLY_MODE         "agent"
+ #define APP_DEFAULT_LCD_BRIGHTNESS           "100"
+ 
+ static const app_config_field_t s_fields[] = {
+@@ -128,6 +129,7 @@ static const app_config_field_t s_fields[] = {
+     APP_CONFIG_FIELD(voice_tts_resource_id, "voice_tts_res", APP_DEFAULT_VOICE_TTS_RESOURCE_ID),
+     APP_CONFIG_FIELD(voice_tts_speaker, "voice_tts_spk", APP_DEFAULT_VOICE_TTS_SPEAKER),
+     APP_CONFIG_FIELD(voice_volume, "voice_volume", APP_DEFAULT_VOICE_VOLUME),
++    APP_CONFIG_FIELD(voice_reply_mode, "voice_reply_md", APP_DEFAULT_VOICE_REPLY_MODE),
+     APP_CONFIG_FIELD(lcd_brightness, "lcd_brightness", APP_DEFAULT_LCD_BRIGHTNESS),
+ };
+ 
+diff --git a/application/edge_agent/components/app_config/include/app_config.h b/application/edge_agent/components/app_config/include/app_config.h
+index bb3a059..eb97564 100644
+--- a/application/edge_agent/components/app_config/include/app_config.h
++++ b/application/edge_agent/components/app_config/include/app_config.h
+@@ -69,6 +69,7 @@ typedef struct {
+     char voice_tts_resource_id[64];
+     char voice_tts_speaker[64];
+     char voice_volume[8];
++    char voice_reply_mode[16];
+     char lcd_brightness[8];
+ } app_config_t;
+ 
+diff --git a/application/edge_agent/components/http_server/http_server_config_api.c b/application/edge_agent/components/http_server/http_server_config_api.c
+index 40f4595..b88eafd 100644
+--- a/application/edge_agent/components/http_server/http_server_config_api.c
++++ b/application/edge_agent/components/http_server/http_server_config_api.c
+@@ -92,6 +92,7 @@ static const config_field_def_t CONFIG_FIELDS[] = {
+     CONFIG_FIELD("voice",        voice_tts_provider),
+     CONFIG_FIELD("voice",        voice_tts_resource_id),
+     CONFIG_FIELD("voice",        voice_tts_speaker),
++    CONFIG_FIELD("voice",        voice_reply_mode),
+ };
+ 
+ static const size_t CONFIG_FIELD_COUNT = sizeof(CONFIG_FIELDS) / sizeof(CONFIG_FIELDS[0]);
+diff --git a/components/claw_modules/claw_core/include/claw_core.h b/components/claw_modules/claw_core/include/claw_core.h
+index 15bbd4b..28a0f46 100644
+--- a/components/claw_modules/claw_core/include/claw_core.h
++++ b/components/claw_modules/claw_core/include/claw_core.h
+@@ -43,6 +43,11 @@ typedef enum {
+ /* Stream incremental assistant text to the on-device voice sink so TTS can
+  * start before the LLM finishes the whole reply. Only set for voice turns. */
+ #define CLAW_CORE_REQUEST_FLAG_STREAM_REPLY        (1U << 4)
++/* Direct reply mode: answer in a single LLM round-trip with a minimal system
++ * prompt, skipping tools, long-term context and persistence. Selected by the
++ * router when a voice turn targets the "voice_llm" chat id. Reuses the agent
++ * loop, streaming bridge and sentence pipeline unchanged. */
++#define CLAW_CORE_REQUEST_FLAG_DIRECT_REPLY        (1U << 5)
+ 
+ #define CLAW_CORE_CONTEXT_PROVIDER_FLAG_REQUEST_START_ONLY (1U << 0)
+ 
+diff --git a/components/claw_modules/claw_core/src/claw_core_agent_loop.c b/components/claw_modules/claw_core/src/claw_core_agent_loop.c
+index 650cbfc..db3e887 100644
+--- a/components/claw_modules/claw_core/src/claw_core_agent_loop.c
++++ b/components/claw_modules/claw_core/src/claw_core_agent_loop.c
+@@ -13,6 +13,7 @@
+ #include <unistd.h>
+ 
+ #include "esp_log.h"
++#include "esp_timer.h"
+ #include "llm/claw_llm_http_transport.h"
+ 
+ static const char *TAG = "claw_core";
+@@ -194,6 +195,9 @@ void claw_core_agent_loop_task(void *arg)
+         if (xQueueReceive(core->request_queue, &request, portMAX_DELAY) != pdTRUE) {
+             continue;
+         }
++        ESP_LOGI(TAG, "timing: agent_dequeue t=%lldms request_id=%u",
++                 (long long)(esp_timer_get_time() / 1000),
++                 (unsigned)request.view.request_id);
+         if (core->stop_requested) {
+             claw_core_free_request_item(&request);
+             break;
+@@ -278,7 +282,7 @@ void claw_core_agent_loop_task(void *arg)
+             }
+         }
+ 
+-        {
++        if (!(request.view.flags & CLAW_CORE_REQUEST_FLAG_DIRECT_REPLY)) {
+             const char *user_texts[1] = {request.view.user_text};
+             esp_err_t persist_err = claw_core_persist_context_user_messages_if_configured(
+                                         core,
+@@ -298,17 +302,19 @@ void claw_core_agent_loop_task(void *arg)
+             goto finish_request;
+         }
+ 
+-        err = claw_core_collect_request_start_only_contexts(core,
+-                                                            &request,
+-                                                            &request_start_contexts,
+-                                                            &request_start_context_count);
+-        if (err != ESP_OK) {
+-            response.view.error_message = claw_utils_string_dup(esp_err_to_name(err));
+-            goto finish_request;
+-        }
+-        if (original_user_persisted &&
+-                claw_core_cached_contexts_have_messages(request_start_contexts, request_start_context_count)) {
+-            inject_active_user = false;
++        if (!(request.view.flags & CLAW_CORE_REQUEST_FLAG_DIRECT_REPLY)) {
++            err = claw_core_collect_request_start_only_contexts(core,
++                                                                &request,
++                                                                &request_start_contexts,
++                                                                &request_start_context_count);
++            if (err != ESP_OK) {
++                response.view.error_message = claw_utils_string_dup(esp_err_to_name(err));
++                goto finish_request;
++            }
++            if (original_user_persisted &&
++                    claw_core_cached_contexts_have_messages(request_start_contexts, request_start_context_count)) {
++                inject_active_user = false;
++            }
+         }
+ 
+         if (request.view.flags & CLAW_CORE_REQUEST_FLAG_STREAM_REPLY) {
+@@ -378,6 +384,10 @@ void claw_core_agent_loop_task(void *arg)
+             }
+ 
+             claw_core_control_set_phase(core, CLAW_CORE_AGENT_LOOP_PHASE_IN_LLM_HTTP);
++            ESP_LOGI(TAG, "timing: llm_http_start t=%lldms request_id=%u iteration=%u",
++                     (long long)(esp_timer_get_time() / 1000),
++                     (unsigned)request.view.request_id,
++                     (unsigned)iteration);
+             err = claw_core_llm_chat_messages(core,
+                                               system_prompt,
+                                               messages,
+diff --git a/components/claw_modules/claw_core/src/claw_core_context.c b/components/claw_modules/claw_core/src/claw_core_context.c
+index f92c288..6ed3160 100644
+--- a/components/claw_modules/claw_core/src/claw_core_context.c
++++ b/components/claw_modules/claw_core/src/claw_core_context.c
+@@ -128,10 +128,29 @@ static esp_err_t append_tool_array_json(cJSON *tools, const char *json_text)
+ }
+ 
+ /* voice 渠道: 浏览器/IM 渠道回复会被 TTS 朗读并播放, 过度冗长会显著拉长首字延迟,
+- * 故对 chat_id = "voice" 的请求追加「简短口语化」约束 (见 docs/voice-integration.md)。 */
++ * 故对 chat_id = "voice" 的请求追加「简短口语化」约束 (见 docs/voice-integration.md)。
++ * "voice_llm" 为 direct 回复模式的语音请求 (见 docs/adr/0001-voice-reply-mode.md),
++ * 同样走 TTS 播放, 故两者都按 voice 处理。 */
+ #define CLAW_CORE_VOICE_CHAT_ID "voice"
++#define CLAW_CORE_VOICE_CHAT_ID_DIRECT "voice_llm"
+ #define CLAW_CORE_VOICE_REPLY_MAX_CHARS 200
+ 
++static bool is_voice_chat_id(const char *chat_id)
++{
++    return chat_id &&
++           (strcmp(chat_id, CLAW_CORE_VOICE_CHAT_ID) == 0 ||
++            strcmp(chat_id, CLAW_CORE_VOICE_CHAT_ID_DIRECT) == 0);
++}
++
++/* direct 回复模式的极简 system prompt: 不注入任何上下文/工具, 只约束口语化与
++ * 能力边界 (见 docs/adr/0001-voice-reply-mode.md 决策 5)。 */
++#define CLAW_CORE_DIRECT_SYSTEM_PROMPT \
++    "You are a helpful voice assistant on a small screenless device. " \
++    "Answer the user's question directly and briefly: at most 2 sentences and no more than " \
++    "80 characters. Use plain spoken language only - no markdown, lists, emoji, code, or URLs. " \
++    "You cannot control or query this device or any smart home equipment; if the user asks for " \
++    "that, tell them in one short sentence to switch to agent mode."
++
+ static char *build_current_turn_prompt(const claw_core_request_t *request)
+ {
+ #define CLAW_CORE_TURN_PROMPT_FMT \
+@@ -158,8 +177,7 @@ static char *build_current_turn_prompt(const claw_core_request_t *request)
+         goto cleanup;
+     }
+ 
+-    is_voice = request->source_chat_id &&
+-               strcmp(request->source_chat_id, CLAW_CORE_VOICE_CHAT_ID) == 0;
++    is_voice = is_voice_chat_id(request->source_chat_id);
+ 
+     if (is_voice) {
+         needed = snprintf(NULL, 0, CLAW_CORE_TURN_PROMPT_VOICE_FMT,
+@@ -529,6 +547,32 @@ esp_err_t claw_core_build_iteration_context(claw_core_state_t *core,
+     *out_messages = NULL;
+     *out_tools_json = NULL;
+ 
++    /* direct 回复模式: 单轮直答。仅用极简 system prompt + 本轮 user 消息,
++     * 不注入任何 context provider、历史消息或工具 schema (见 ADR 0001 决策 1/5)。 */
++    if (request->view.flags & CLAW_CORE_REQUEST_FLAG_DIRECT_REPLY) {
++        system_prompt = claw_utils_string_dup(CLAW_CORE_DIRECT_SYSTEM_PROMPT);
++        messages = cJSON_CreateArray();
++        if (!system_prompt || !messages) {
++            err = ESP_ERR_NO_MEM;
++            goto cleanup;
++        }
++        if (inject_active_user) {
++            err = claw_core_append_user_message(messages, request->view.user_text);
++            if (err != ESP_OK) {
++                goto cleanup;
++            }
++        }
++        ESP_LOGI(TAG, "direct_reply request=%" PRIu32 " context=0 tools=0",
++                 request->view.request_id);
++        *out_system_prompt = system_prompt;
++        *out_messages = messages;
++        *out_tools_json = NULL;
++        system_prompt = NULL;
++        messages = NULL;
++        err = ESP_OK;
++        goto cleanup;
++    }
++
+     system_prompt = claw_utils_string_dup(core->system_prompt);
+     messages = cJSON_CreateArray();
+     tools = cJSON_CreateArray();
+diff --git a/components/claw_modules/claw_event_router/src/claw_event_router.c b/components/claw_modules/claw_event_router/src/claw_event_router.c
+index b938d6e..f389ae4 100644
+--- a/components/claw_modules/claw_event_router/src/claw_event_router.c
++++ b/components/claw_modules/claw_event_router/src/claw_event_router.c
+@@ -24,6 +24,7 @@
+ #include "claw_task.h"
+ #include "esp_heap_caps.h"
+ #include "esp_log.h"
++#include "esp_timer.h"
+ #include "freertos/idf_additions.h"
+ #include "freertos/queue.h"
+ #include "freertos/semphr.h"
+@@ -1793,12 +1794,29 @@ static esp_err_t claw_event_router_execute_agent_action(
+     agent_input.target_chat_id = (target_chat_id && target_chat_id[0]) ? target_chat_id : event->chat_id;
+ 
+     /* Voice turns stream the assistant reply incrementally to the on-device
+-     * voice sink so TTS can start before the LLM finishes. */
+-    if ((agent_input.target_chat_id && strcmp(agent_input.target_chat_id, "voice") == 0) ||
+-            (agent_input.source_chat_id && strcmp(agent_input.source_chat_id, "voice") == 0)) {
+-        agent_input.flags |= CLAW_CORE_REQUEST_FLAG_STREAM_REPLY;
++     * voice sink so TTS can start before the LLM finishes. The "voice_llm"
++     * chat id selects direct reply mode (single LLM round-trip, no tools or
++     * long-term context); see docs/adr/0001-voice-reply-mode.md. */
++    {
++        bool is_voice = (agent_input.target_chat_id && strcmp(agent_input.target_chat_id, "voice") == 0) ||
++                        (agent_input.source_chat_id && strcmp(agent_input.source_chat_id, "voice") == 0);
++        bool is_direct = (agent_input.target_chat_id && strcmp(agent_input.target_chat_id, "voice_llm") == 0) ||
++                         (agent_input.source_chat_id && strcmp(agent_input.source_chat_id, "voice_llm") == 0);
++
++        if (is_voice || is_direct) {
++            agent_input.flags |= CLAW_CORE_REQUEST_FLAG_STREAM_REPLY;
++        }
++        if (is_direct) {
++            agent_input.flags |= CLAW_CORE_REQUEST_FLAG_DIRECT_REPLY;
++        }
+     }
+ 
++    ESP_LOGI(TAG, "timing: router_submit t=%lldms request_id=%" PRIu32 " chat_id=%s stream=%d direct=%d",
++             (long long)(esp_timer_get_time() / 1000),
++             agent_input.request_id,
++             agent_input.target_chat_id ? agent_input.target_chat_id : "(null)",
++             (agent_input.flags & CLAW_CORE_REQUEST_FLAG_STREAM_REPLY) ? 1 : 0,
++             (agent_input.flags & CLAW_CORE_REQUEST_FLAG_DIRECT_REPLY) ? 1 : 0);
+     err = claw_agent_mgr_submit_root(&agent_input,
+                                      s_runtime->config.agent_submit_timeout_ms);
+ 

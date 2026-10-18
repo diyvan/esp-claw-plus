@@ -242,6 +242,11 @@ export const zhCn: Dict = {
   voiceEnable: '启用语音助手',
   voiceEnableHint:
     '关闭后按键说话与唤醒词都停用，设备端隐藏「语音」页面。修改后立即生效。',
+  voiceReplyMode: '回复模式',
+  voiceReplyModeHint:
+    '「智能体」使用工具与记忆，回答能力更强；「直答」跳过工具与记忆，直接单次请求 LLM，响应更快。下一轮语音生效。',
+  voiceReplyModeAgent: '智能体（工具 + 记忆）',
+  voiceReplyModeDirect: '直答（快速、单轮）',
   voiceWakeSection: '唤醒词',
   voiceWakeEnable: '启用唤醒词',
   voiceWakeHint: '开启后说出唤醒词即开始免提录音；关闭后仅使用按键说话。修改后立即生效。',
@@ -258,6 +263,14 @@ export const zhCn: Dict = {
   voiceProviderHint:
     '火山引擎使用流式语音识别 2.0（WebSocket 边说边发）与流式语音合成，需新版控制台 API Key（X-Api-Key）；地址与资源 ID 留空则使用官方默认值。',
   voiceTtsSection: '语音合成 (TTS)',
+  voiceTtsEngine: 'TTS 引擎',
+  voiceTtsEngineHint:
+    '云 TTS 音色更好但需网络往返；本地 TTS 在设备端合成，首字播放延迟最低（仅中文，音色固定，仅支持边收边播）。',
+  voiceTtsEngineCloud: '云 TTS',
+  voiceTtsEngineLocal: '本地 TTS',
+  voiceTtsStream: '边收边播',
+  voiceTtsStreamHint:
+    '开启后，LLM 回复仍在生成时即对每句边合成边播放，降低首段音频延迟。下一轮语音生效。',
   voiceTtsProvider: 'TTS 服务商',
   voiceTtsUrl: 'TTS 接口地址',
   voiceTtsUrlPlaceholder: 'http://example.com/v1/audio/speech',

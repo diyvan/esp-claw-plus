@@ -53,6 +53,8 @@ export type AppConfig = {
   voice_tts_provider: string;
   voice_tts_resource_id: string;
   voice_tts_speaker: string;
+  voice_reply_mode: string;
+  voice_tts_stream: string;
 };
 
 /** Server-side configuration groups (must stay in sync with
@@ -113,6 +115,8 @@ export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
     'voice_tts_provider',
     'voice_tts_resource_id',
     'voice_tts_speaker',
+    'voice_reply_mode',
+    'voice_tts_stream',
   ],
 };
 

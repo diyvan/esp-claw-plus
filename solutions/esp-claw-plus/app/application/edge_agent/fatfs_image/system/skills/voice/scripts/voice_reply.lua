@@ -3,6 +3,7 @@
 -- 链路: 路由规则匹配 claw_core / out_message (chat_id = "voice") -> 本脚本 -> TTS -> 播放
 --
 -- V1 说明: TTS 端点/密钥从 /fatfs/ha_voice_runtime.json 读取。
+--   voice_tts_provider 为 "local": 走设备端 esp-tts 本地合成, 直接流式播放 (无落盘/无网络)。
 --   voice_tts_provider 为空/generic: 走原通用端点 (voice_tts_url), 把回复文本 POST 给云 TTS,
 --             响应音频经 save_path 落盘; 端点为空则直接放弃本次回复。
 --   voice_tts_provider 非空: 加载 providers/tts_<provider>.lua 完成合成并落盘 (如 volcano 火山云,
@@ -60,18 +61,10 @@ if not codec then
     return
 end
 
-local output = audio.new_output({ codec, rate, channels, bits, volume = 80 })
+local output = audio.new_output({ codec, rate, channels, bits, volume = tonumber(cfg.voice_volume) or 80 })
 if not output then
     print(TAG .. " open audio output failed, skip playback")
     set_error("扬声器占用")
-    return
-end
-
--- 合成: 统一走共享模块 voice_tts (generic 端点或 provider 分派)。
-local save_path, tts_error = tts.synthesize(cfg, text, "voice_reply", storage.get_root_dir())
-if not save_path then
-    set_error(tts_error or "语音合成失败")
-    output:close()
     return
 end
 
@@ -86,17 +79,37 @@ if not player then
     return
 end
 
-local started = player:play(save_path) -- 默认异步 (wait 缺省 false)
-if not started then
-    print(TAG .. " play failed: " .. save_path)
-    set_error("播放失败")
-    player:close()
-    output:close()
-    return
+if tts.is_local(cfg) then
+    -- 本地引擎 (esp-tts): 无落盘中间产物, 直接流式合成播放。
+    -- 单段文本: 建会话后立即声明不再追加, 队列排空即自然收尾 (EOF)。
+    if not player:play_stream(tts.stream_request(cfg, text)) then
+        print(TAG .. " play_stream failed")
+        set_error("播放失败")
+        player:close()
+        output:close()
+        return
+    end
+    player:play_stream_finish()
+else
+    -- 合成: 统一走共享模块 voice_tts (generic 端点或 provider 分派)。
+    local save_path, tts_error = tts.synthesize(cfg, text, "voice_reply", storage.get_root_dir())
+    if not save_path then
+        set_error(tts_error or "语音合成失败")
+        player:close()
+        output:close()
+        return
+    end
+    if not player:play(save_path) then
+        print(TAG .. " play failed: " .. save_path)
+        set_error("播放失败")
+        player:close()
+        output:close()
+        return
+    end
+    print(TAG .. " playback started: " .. save_path)
 end
 
 set_status("speaking")
-print(TAG .. " playback started: " .. save_path)
 
 -- 轮询到播放结束; 期间若用户开始说话 (barge-in) 立即停止。
 local interrupted = false

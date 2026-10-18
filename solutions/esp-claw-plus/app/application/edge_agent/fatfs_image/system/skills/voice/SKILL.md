@@ -28,6 +28,13 @@ ASR 转文本后注入 Agent, Agent 的回复再经 TTS 播放。
 - `scripts/voice_common.lua` — 共享模块, 是三个 `/fatfs` 约定的**唯一 owner**: 屏幕桥
   (对话文本上屏)、运行时配置桥、语音打断信道。`voice_ptt.lua` / `voice_reply.lua` /
   `voice_e2e.lua` 都 `require("voice_common")` (与调用方同目录, `package.path` 首位即命中)。
+- `scripts/voice_stream.lua` — 共享模块, 是 `voice_stream.txt` **流式回复桥** (文件名 / 结束
+  哨兵 `\1\1END\1\1` / 整读差分 / 按标点切句) 的**唯一 owner**。`voice_ptt.lua` (逐句播报) 与
+  `voicetest/voice_e2e.lua` (自测) 都 `require("voice_stream")`: `consumer({root_dir=?, read=?})`
+  返回消费者, 循环 `:next()` 取句、`:finished()` 判读完; `read` 可注入合成增量以便离线测试,
+  `reset(root_dir)` 清上一轮残留。另有计时/首句延迟: `on_first_sentence(sentence, latency_ms)`
+  首句回调、`c.first_latency_ms`、`first_sentence_ms`(默认 600, 0 关闭) 首句无终止符超时强制
+  软切; 时钟经 `now` 注入便于测试。
 - `scripts/voice_selftest.lua` — 录音+回放自检 (不依赖 BOOT 键), 用于验证麦克风/扬声器
   通路: `lua --run --path /system/skills/voice/scripts/voice_selftest.lua`。
 - `scripts/providers/` — 云端服务适配层 (供应商插件)。`util.lua` 提供 base64 编解码 /
@@ -42,13 +49,17 @@ ASR 转文本后注入 Agent, Agent 的回复再经 TTS 播放。
 
 ## 路由规则 (必须成对存在)
 
-语音链路依赖两条路由规则 (`/fatfs/router_rules/router_rules.json`):
+语音链路依赖三条路由规则 (`/fatfs/router_rules/router_rules.json`):
 
 1. `voice_reply_run_script` — 匹配 `source_cap=claw_core`、`event_type=out_message`、
-   `chat_id=voice`, 动作 `run_script` 调用 `voice_reply.lua`, 参数 `args.text={{event.text}}`。
-   必须排在默认规则 `agent_out_message_send_message` **之前**(`consume_on_match=true`)。
-   本设备通过 `event_router --add-rule-json` 安装, 新规则会被插入到规则数组最前面。
-2. `startup_voice_ptt` — 匹配 `source_cap=app_claw`、`event_type=startup`、
+   `chat_id=voice` (agent 回复模式), 动作 `run_script` 调用 `voice_reply.lua`,
+   参数 `args.text={{event.text}}`。必须排在默认规则 `agent_out_message_send_message`
+   **之前**(`consume_on_match=true`)。本设备通过 `event_router --add-rule-json` 安装,
+   新规则会被插入到规则数组最前面。
+2. `voice_reply_run_script_direct` — 同上, 但匹配 `chat_id=voice_llm` (direct 回复模式,
+   见 `docs/adr/0001-voice-reply-mode.md`)。router 的 `chat_id` 匹配是**精确 strcmp**,
+   故 agent / direct 各需一条规则。
+3. `startup_voice_ptt` — 匹配 `source_cap=app_claw`、`event_type=startup`、
    `event_key=boot_completed`, 动作 `run_script` (`async: true`) 启动 `voice_ptt.lua` 常驻任务。
 
 规则的完整 JSON 见 `solutions/ha_ai_panel/app/router_rules/voice_rules.json`,
@@ -65,6 +76,7 @@ ASR 转文本后注入 Agent, Agent 的回复再经 TTS 播放。
 generic 契约 (默认, 行为与历史版本完全一致); 否则 `require("providers.<asr|tts>_<provider>")`。
 ASR 适配器若导出 `open` 则走**流式会话** (边说边发、增量上屏), 否则回退到 `transcribe`
 批量契约; TTS 适配器调用 `synthesize`。目前内置 `volcano` (火山引擎 / 豆包语音)。
+`voice_tts_provider == "local"` 是本机引擎 (见下节「本地 TTS」), **不加载适配器**。
 
 ### generic 契约 (默认, 端点非空时)
 
@@ -105,6 +117,23 @@ ASR 适配器若导出 `open` 则走**流式会话** (边说边发、增量上�
   (NVS `http_allow_ls` / `search_http_allowlist`), 否则会被拒绝。ASR 改走 WebSocket
   (`cap_asr_stream`) **不受该白名单限制**。
 
+### 本地 TTS (provider = "local")
+
+**设备端合成, 无网络往返**——用于压低「LLM 首字 → 首字播放」延迟。esp-sr 自带 esp-tts 中文引擎,
+语音数据烧在独立 `voice_data` 分区 (运行时 mmap)。**仅中文、固定音色 (xiaole)、无 speaker 可选**,
+且**只支持边收边播** (没有「整段合成 → 落盘 → 播放」路径), 故 `voice_ptt.lua` 的
+`stream_enabled()` 对它**恒为开**。
+
+- `voice_tts.stream_request(cfg, text)` 在本地引擎下**不发 HTTP**, 直接返回
+  `{ ["local"] = true, text = <文本>, speed = 2 }`; `voice_tts.synthesize()` 在本地引擎下返回
+  「本地 TTS 仅支持流式播报」。
+- `audio.player:play_stream(req)` 见到 `req.local` 时分派到 `cap_tts_stream_begin_local`
+  (`append` 同理), URI 用 `raw://tts/stream.pcm`; 本地模式产出 **16kHz / 单声道 / 16-bit PCM**,
+  直接进播放器的 ASRC (16k→48k)。
+- 语速 `speed` 取值 1..5 (默认 2), 由 `esp_tts_stream_play` 控制。
+- 提示: 本地模式下 `voice_tts_url` / `voice_tts_api_key` / `voice_tts_resource_id` /
+  `voice_tts_speaker` 均**不生效**。
+
 ## 语音打断 (barge-in)
 
 跨脚本唯一可行的信道是 `/fatfs` 文件 (音频无全局仲裁器): 用户按下 BOOT 或唤醒命中时,
@@ -131,10 +160,11 @@ Lua<->C 绑定)。字段:
 | `voice_asr_provider` | ASR 供应商; 空 / `generic` = 通用契约, `volcano` = 火山引擎 |
 | `voice_asr_url` / `voice_asr_api_key` | ASR 端点与密钥 (火山云用新版控制台 `X-Api-Key`) |
 | `voice_asr_resource_id` | ASR 资源 ID; 留空用 provider 默认 (`volc.seedasr.sauc.duration`) |
-| `voice_tts_provider` | TTS 供应商; 空 / `generic` = 通用契约, `volcano` = 火山引擎 |
-| `voice_tts_url` / `voice_tts_api_key` | TTS 端点与密钥 |
+| `voice_tts_provider` | TTS 引擎; 空 / `generic` = 云通用契约, `volcano` = 火山引擎 (云), `local` = **设备端本地 TTS** (esp-tts, 见上节) |
+| `voice_tts_url` / `voice_tts_api_key` | TTS 端点与密钥 (本地引擎下不生效) |
 | `voice_tts_resource_id` | TTS 资源 ID; 留空用 provider 默认 (`seed-tts-2.0`) |
 | `voice_tts_speaker` | TTS 发音人; 留空用 provider 默认 (`zh_female_vv_uranus_bigtts`) |
+| `voice_tts_stream` | 边收边播开关; `true` 时每句回复走 TTS 流式 (`player:play_stream`) 边收边播, 不再整句合成落盘; 默认 `false`; **`voice_tts_provider=local` 时恒为开** |
 | `ha_enabled` / `ha_base_url` / `ha_token` | Home Assistant 开关与接入信息 (M2 意图路由使用) |
 
 配置在网页保存后即时生效, 无需重启 (脚本每 1s 重新读取一次)。

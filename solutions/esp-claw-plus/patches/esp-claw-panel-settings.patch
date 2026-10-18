@@ -1,0 +1,31 @@
+--- a/application/edge_agent/components/app_config/include/app_config.h
++++ b/application/edge_agent/components/app_config/include/app_config.h
+@@ -68,6 +68,8 @@
+     char voice_tts_provider[32];
+     char voice_tts_resource_id[64];
+     char voice_tts_speaker[64];
++    char voice_volume[8];
++    char lcd_brightness[8];
+ } app_config_t;
+ 
+ esp_err_t app_config_init(void);
+--- a/application/edge_agent/components/app_config/app_config.c
++++ b/application/edge_agent/components/app_config/app_config.c
+@@ -75,6 +75,8 @@
+ #define APP_DEFAULT_VOICE_TTS_PROVIDER       ""
+ #define APP_DEFAULT_VOICE_TTS_RESOURCE_ID    ""
+ #define APP_DEFAULT_VOICE_TTS_SPEAKER        ""
++#define APP_DEFAULT_VOICE_VOLUME             "80"
++#define APP_DEFAULT_LCD_BRIGHTNESS           "100"
+ 
+ static const app_config_field_t s_fields[] = {
+     APP_CONFIG_FIELD(wifi_ssid, "wifi_ssid", APP_WIFI_SSID),
+@@ -125,6 +127,8 @@
+     APP_CONFIG_FIELD(voice_tts_provider, "voice_tts_prov", APP_DEFAULT_VOICE_TTS_PROVIDER),
+     APP_CONFIG_FIELD(voice_tts_resource_id, "voice_tts_res", APP_DEFAULT_VOICE_TTS_RESOURCE_ID),
+     APP_CONFIG_FIELD(voice_tts_speaker, "voice_tts_spk", APP_DEFAULT_VOICE_TTS_SPEAKER),
++    APP_CONFIG_FIELD(voice_volume, "voice_volume", APP_DEFAULT_VOICE_VOLUME),
++    APP_CONFIG_FIELD(lcd_brightness, "lcd_brightness", APP_DEFAULT_LCD_BRIGHTNESS),
+ };
+ 
+ // for backward compatibility, migrate from old settings to new settings

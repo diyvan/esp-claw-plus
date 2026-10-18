@@ -16,6 +16,16 @@ local M = {}
 
 local TAG = "[voice_tts]"
 
+-- 「本地 TTS」: 设备端 esp-tts 合成, 无网络往返, 首字延迟远低于云端。
+-- 该引擎只支持流式播报 (边合成边播放), 不支持落盘。
+M.LOCAL_PROVIDER = "local"
+local LOCAL_DEFAULT_SPEED = 2   -- 0 最慢 ~ 5 最快
+
+-- 当前配置是否使用本地 TTS 引擎。
+function M.is_local(cfg)
+    return (cfg.voice_tts_provider or "") == M.LOCAL_PROVIDER
+end
+
 -- 把文本转义成 JSON 字符串内容。
 local function json_escape(s)
     return (s:gsub('[%c\\"]', function(c)
@@ -72,6 +82,11 @@ end
 function M.synthesize(cfg, text, out_base, root_dir)
     local provider = cfg.voice_tts_provider or ""
 
+    if provider == M.LOCAL_PROVIDER then
+        -- 本地引擎由 esp-tts 直接输出 PCM 流, 无「合成到文件」语义。
+        return nil, "本地 TTS 仅支持流式播报"
+    end
+
     if provider == "" or provider == "generic" then
         if (cfg.voice_tts_url or "") == "" then
             return nil, "未配置 TTS"
@@ -99,6 +114,11 @@ end
 -- provider 不支持流式时返回 nil (调用方回退到 M.synthesize 的落盘路径)。
 function M.stream_request(cfg, text)
     local provider = cfg.voice_tts_provider or ""
+    if provider == M.LOCAL_PROVIDER then
+        -- audio.player:play_stream{ local=true, ... } 走设备端 esp-tts (16k/mono/16bit PCM)。
+        -- 注意: "local" 是 Lua 关键字, 建表时必须用 ["local"] 形式。
+        return { ["local"] = true, text = text, speed = LOCAL_DEFAULT_SPEED }
+    end
     if provider == "" or provider == "generic" then
         return nil
     end

@@ -188,7 +188,7 @@ ASR/TTS 端点与 `voice_wake_enabled` 门控，**保存即生效、无需重启
 
 | 卡片 | 行 | 数据源 / 判定 |
 |---|---|---|
-| 网络 | 网络名 / 连接 / IP 地址 | `app_config.wifi_ssid` + `wifi_manager_get_status()`（`sta_connected`→已连接(绿)+IP；`ap_active`→AP 模式；`sta_configured`→未连接；否则未设置） |
+| 网络 | 网络名 / 连接 / IP 地址 / AP 热点 | `app_config.wifi_ssid` + `wifi_manager_get_status()`（`sta_connected`→已连接(绿)+IP；`ap_active`→AP 模式；`sta_configured`→未连接；否则未设置）。AP 热点行独立展示 `ap_ssid` + `ap_ip`（`ap_active`→开着(绿)，否则"未开启"） |
 | LLM | 状态 / 模型 | `llm_api_key` 或 `llm_base_url` 非空 → 已设置；模型取 `llm_model`（空显示 `-`） |
 | IM | 已设置: N/4 + 两行渠道标记 | 逐渠道判凭据：微信 `wechat_token`、飞书 `feishu_app_id`、QQ `qq_app_id`、电报 `tg_bot_token`；不臆造"已连接" |
 | 语音 | 语音唤醒 / ASR / TTS | `voice_wake_enabled` 门控 + `voice_asr_url` / `voice_tts_url` 是否已配置 |

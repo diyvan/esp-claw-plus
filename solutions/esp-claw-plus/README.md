@@ -215,21 +215,24 @@ ESP-Claw 与小智都是**完整应用框架**(各自拥有 main、任务模型�
 |---|---|
 | `voice_enabled` | 语音助手**总开关**;**关闭**时设备端隐藏「语音」分页,按键说话(PTT)与唤醒词一并停用 |
 | `voice_wake_enabled` | 本地唤醒开关(仅在 `voice_enabled` 开启时生效);**关闭**时忽略 WakeNet 触发(PTT 仍可用) |
+| `voice_reply_mode` | 语音回复模式;`agent`(默认)=走 Agent Loop(工具/上下文/HA),`direct`=单轮直答(极简提示词、无工具与上下文,延迟更稳);设备「语音」页与网页面板均可切换 |
 | `voice_asr_provider` | ASR 供应商;**空 / `generic`** = 通用契约(默认,行为不变);`volcano` = 火山引擎(豆包语音) |
 | `voice_asr_url` / `voice_asr_api_key` | 云 ASR 端点与密钥(空则不伪造转写, 直接放弃本次识别);火山云用新版控制台 `X-Api-Key` |
 | `voice_asr_resource_id` | ASR 资源 ID;留空由 provider 取默认(`volc.seedasr.sauc.duration`) |
-| `voice_tts_provider` | TTS 供应商;**空 / `generic`** = 通用契约(默认,行为不变);`volcano` = 火山引擎 |
+| `voice_tts_provider` | TTS 引擎/供应商;**空 / `generic`** = 云通用契约(默认);`volcano` = 火山引擎(云);**`local`** = **设备端本地 TTS**(esp-tts,见下) |
 | `voice_tts_url` / `voice_tts_api_key` | 云 TTS 端点与密钥(空则放弃本次播报, 不播提示音) |
 | `voice_tts_resource_id` | TTS 资源 ID;留空由 provider 取默认(`seed-tts-2.0`) |
 | `voice_tts_speaker` | TTS 发音人;留空由 provider 取默认(`zh_female_vv_uranus_bigtts`) |
 
 > **供应商扩展机制**:脚本对云端服务做了 provider 分派——`voice_asr_provider` / `voice_tts_provider` 为空或 `generic` 时走原通用契约,填其它名字时按 `require("providers.<asr|tts>_<provider>")` 加载适配器(见 `voice/scripts/providers/`)。**新增其他语音服务(如阿里云)只需加一个适配器文件,不改 generic 路径。** 火山引擎采用**新版控制台鉴权**(仅 `X-Api-Key`),详见 [docs/voice-integration.md](docs/voice-integration.md) §6.3。
 
+> **TTS 引擎(云 / 本地)**:网页「语音助手」页的「TTS 引擎」下拉切换——**云 TTS**(默认)= 上面的云端 provider 设置(音色更好,需网络往返);**本地 TTS**(`voice_tts_provider=local`)= 用 esp-sr 自带的 esp-tts 中文引擎在**设备端**合成,把「LLM 首字 → 首字播放」压到最低。本地 TTS 固定音色(xiaole)、**仅中文**、仅支持边收边播(`voice_tts_stream` 对它恒为开),语音数据烧在独立 `voice_data` 分区(运行时 mmap,不占 RAM)。本板为单 app 槽分区,故**不再支持 OTA**。详见 [docs/voice-integration.md](docs/voice-integration.md) §7.8。
+
 | 功能 | 规格 |
 |---|---|
 | 唤醒 | esp-sr 本地唤醒(自定义唤醒词),受 `voice_enabled` + `voice_wake_enabled` 门控;命中唤醒词时**设备端自动跳转到「语音」页**;BOOT 键 PTT 备用(不跳转) |
 | 对话 | 连续多轮;语音打断(说话时打断 TTS 播放) |
-| 执行主体 | 唤醒后动作**恒由 ESP-Claw Agent 执行**;`ha_enabled` 仅决定 Agent 是否可触达 HA(见 §6.3) |
+| 执行主体 | `voice_reply_mode=agent`(默认)时唤醒后动作**恒由 ESP-Claw Agent 执行**,`ha_enabled` 仅决定 Agent 是否可触达 HA(见 §6.3);`direct` 时不调工具、不读上下文,直接由 LLM 单轮作答 |
 | 意图 | 语音文本同时支持闲聊与设备指令;`ha_enabled` **启用**时由 LLM 意图识别判断是否需要 HA,**仅需要时**经 MCP 转 HA;**关闭**时直接走 ESP-Claw 自身能力 |
 | 显示 | 语音页:唤醒状态、实时字幕、Agent 执行步骤与结果 |
 

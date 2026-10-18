@@ -29,11 +29,17 @@ SR_PATCH="$SOLUTION_DIR/patches/esp-claw-esp-sr.patch"
 VOICE_WAKE_PATCH="$SOLUTION_DIR/patches/esp-claw-voice-wake.patch"
 STACK_PATCH="$SOLUTION_DIR/patches/esp-claw-p4-task-stack-internal.patch"
 HA_VOICE_PATCH="$SOLUTION_DIR/patches/esp-claw-ha-voice-config.patch"
+PANEL_SETTINGS_PATCH="$SOLUTION_DIR/patches/esp-claw-panel-settings.patch"
 HA_MCP_PATCH="$SOLUTION_DIR/patches/esp-claw-ha-mcp-token.patch"
 ASR_STREAM_PATCH="$SOLUTION_DIR/patches/esp-claw-asr-stream.patch"
 VOICE_LATENCY_PATCH="$SOLUTION_DIR/patches/esp-claw-voice-latency.patch"
 LLM_STREAM_PATCH="$SOLUTION_DIR/patches/esp-claw-llm-stream.patch"
 TTS_STREAM_PATCH="$SOLUTION_DIR/patches/esp-claw-tts-stream.patch"
+TTS_STREAM_PIPELINE_PATCH="$SOLUTION_DIR/patches/esp-claw-tts-stream-pipeline.patch"
+DIRECT_REPLY_PATCH="$SOLUTION_DIR/patches/esp-claw-direct-reply.patch"
+TTS_STREAM_CONFIG_PATCH="$SOLUTION_DIR/patches/esp-claw-tts-stream-config.patch"
+HTTP_REUSE_PATCH="$SOLUTION_DIR/patches/esp-claw-http-reuse.patch"
+TTS_LOCAL_PATCH="$SOLUTION_DIR/patches/esp-claw-tts-local.patch"
 APP_OVERLAY="$SOLUTION_DIR/app/application/edge_agent/main"
 FS_OVERLAY="$SOLUTION_DIR/app/application/edge_agent/fatfs_image"
 UI_OVERLAY="$SOLUTION_DIR/app/application/edge_agent/components/http_server/frontend_source"
@@ -147,6 +153,16 @@ else
     exit 1
 fi
 
+echo "==> 叠加面板设置项 (音量/亮度持久化: app_config 新增 voice_volume/lcd_brightness)"
+if git -C "$SRC_DIR" apply --check "$PANEL_SETTINGS_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$PANEL_SETTINGS_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$PANEL_SETTINGS_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+
 echo "==> 叠加 Web 配置前端 (HA + 语音助手页, 含已构建 dist)"
 cp -R "$UI_OVERLAY"/. "$SRC_DIR/application/edge_agent/components/http_server/frontend_source/"
 
@@ -201,7 +217,70 @@ else
     exit 1
 fi
 echo "    注意: 新增 cap_tts_stream 组件后首次构建需先 idf.py reconfigure(idf_component.yml 缓存)"
-echo "    开关: 设备 /fatfs 下新建空文件 voice_tts_stream 启用边收边播, 删除即回退落盘合成"
+echo "    开关: 运行时配置 voice_tts_strm (默认 false), 网页面板『语音助手』页可切换"
+
+echo "==> 语音链路延迟优化 (TTS 分句流水线: 多句音频无缝拼接, 消除句间静音断层)"
+if git -C "$SRC_DIR" apply --check "$TTS_STREAM_PIPELINE_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$TTS_STREAM_PIPELINE_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$TTS_STREAM_PIPELINE_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+echo "    说明: cap_tts_stream 支持 begin/append/finish 段队列, 同会话环形缓冲追加解码音频;"
+echo "          audio.player 新增 play_stream_append/play_stream_finish; voice_ptt 边切句边入流"
+
+echo "==> 语音回复模式开关 (direct 单轮直答 / agent 智能体; 设备面板与网页面板可切换)"
+if git -C "$SRC_DIR" apply --check "$DIRECT_REPLY_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$DIRECT_REPLY_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$DIRECT_REPLY_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+echo "    说明: 模式存 NVS voice_reply_mode (默认 agent); direct 时语音请求改走 chat_id=voice_llm"
+
+echo "==> 边收边播开关提升为运行时配置 (voice_tts_stream 存 NVS, 网页面板可切换)"
+if git -C "$SRC_DIR" apply --check "$TTS_STREAM_CONFIG_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$TTS_STREAM_CONFIG_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$TTS_STREAM_CONFIG_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+echo "    说明: 开关存 NVS voice_tts_strm (默认 false); 网页面板『语音助手』页可切换"
+
+echo "==> 语音链路延迟优化 (HTTP 连接复用池: 多轮 LLM 往返 / 非流式 TTS 复用 TCP+TLS)"
+if git -C "$SRC_DIR" apply --check "$HTTP_REUSE_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$HTTP_REUSE_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$HTTP_REUSE_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+echo "    说明: 启用 CONFIG_HTTP_REUSE_ENABLE=y (上游因 issue #101 默认关闭; 本板 P4 可接受),"
+echo "          caller 侧 opt-in (keep_alive_enable): LLM transport + cap_http_request;"
+echo "          cap_tts_stream 走 open/read 不走 perform, 不入池"
+echo "    注意: 改动 sdkconfig.defaults 后需重新生成 sdkconfig (删 application/edge_agent/sdkconfig 或重跑 bmgr),"
+echo "          且 LINK_OPTIONS 变更后需 idf.py reconfigure"
+
+echo "==> 设备端本地 TTS (esp-tts 中文, 压低『LLM 首字 → 首字播放』延迟)"
+if git -C "$SRC_DIR" apply --check "$TTS_LOCAL_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$TTS_LOCAL_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$TTS_LOCAL_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+echo "    说明: cap_tts_stream 增本地模式 (mmap voice_data 分区 + esp_tts_voice_xiaole + 16kHz/单声道 PCM),"
+echo "          lua audio.player 请求带 local=true 时走 raw://tts/stream.pcm; 语音设置页『TTS 引擎』可选本地/云。"
+echo "    注意: 分区表新增 voice_data 且 ota_0 扩至 5MB(去掉 ota_1), 首次构建需 idf.py reconfigure;"
+echo "          语音数据由 esptool_py_flash_to_partition 随 idf.py flash 一起烧录, 无需单独烧录。"
 
 echo "==> 生成 board manager 配置"
 cd "$SRC_DIR/application/edge_agent"

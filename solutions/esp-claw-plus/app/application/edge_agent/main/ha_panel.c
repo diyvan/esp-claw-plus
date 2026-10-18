@@ -52,6 +52,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "ha_voice_wake.h"
+#include "ha_panel_settings.h"
 #include "lvgl.h"
 #include "wifi_manager.h"
 
@@ -149,6 +150,16 @@ static lv_obj_t *s_status_label;
 static lv_obj_t *s_voice_log;     /* scrollable conversation bubble list */
 static char s_status_raw[HA_VOICE_STATUS_MAX];   /* last "<code>|<detail>" */
 
+/* Reply-mode toggle shown on the voice page: switches the next voice turn
+ * between agent mode (tools + memory) and direct mode (single LLM round-trip).
+ * Persisted to app_config.voice_reply_mode and mirrored to the runtime JSON for
+ * the Lua skills; see docs/adr/0001-voice-reply-mode.md. */
+static lv_obj_t *s_reply_mode_label;
+static bool s_reply_mode_direct;
+static volatile bool s_reply_mode_dirty;
+
+static void ha_panel_reply_mode_set_label(bool direct);
+
 /* Conversation bridge buffers. They live in PSRAM: 40 KB read + snapshot would
  * not fit the tight internal RAM and the render path never needs DMA memory.
  * Allocation is best-effort; when NULL the poll degrades to a no-op. */
@@ -165,6 +176,7 @@ static lv_obj_t *s_panel_ha_url_label;
 static lv_obj_t *s_info_net_name_label;
 static lv_obj_t *s_info_net_state_label;
 static lv_obj_t *s_info_net_ip_label;
+static lv_obj_t *s_info_net_ap_label;
 static lv_obj_t *s_info_llm_state_label;
 static lv_obj_t *s_info_llm_model_label;
 static lv_obj_t *s_info_im_state_label;
@@ -180,6 +192,7 @@ static char s_panel_ha_url_text[APP_CONFIG_STR_LEN + 16];
 static char s_info_net_name_text[APP_CONFIG_STR_LEN + 16];
 static char s_info_net_state_text[64];
 static char s_info_net_ip_text[64];
+static char s_info_net_ap_text[96];
 static char s_info_llm_state_text[64];
 static char s_info_llm_model_text[APP_CONFIG_STR_LEN + 16];
 static char s_info_im_state_text[64];
@@ -787,9 +800,10 @@ static void ha_panel_refresh_panel(const app_config_t *cfg)
                        url, lv_color_hex(HA_COLOR_TEXT_DIM));
 }
 
-/* Device page, network group: configured SSID + live connection state + IP.
- * wifi_manager keeps sta_ip/ap_ip as static strings (never NULL; "0.0.0.0"
- * when unset), so the IP row only shows a value once it is meaningful. */
+/* Device page, network group: configured SSID + live connection state + IP +
+ * AP hotspot (name/IP). wifi_manager keeps sta_ip/ap_ip as static strings
+ * (never NULL; "0.0.0.0" when unset), so the IP rows only show a value once it
+ * is meaningful. */
 static void ha_panel_refresh_network(void)
 {
     wifi_manager_status_t st;
@@ -834,6 +848,20 @@ static void ha_panel_refresh_network(void)
              (ip && ip[0] && strcmp(ip, "0.0.0.0") != 0) ? ip : "-");
     ha_panel_set_label(s_info_net_ip_label, s_info_net_ip_text, sizeof(s_info_net_ip_text),
                        ip_line, lv_color_hex(HA_COLOR_TEXT_DIM));
+
+    /* AP hotspot: name + gateway IP so the provisioning AP is identifiable even
+     * when a STA SSID is also configured (name row would show the STA one). */
+    char ap_line[96];
+    if (st.ap_active) {
+        const char *ap_ssid = (st.ap_ssid && st.ap_ssid[0]) ? st.ap_ssid : "-";
+        const char *ap_ip = (st.ap_ip && st.ap_ip[0] && strcmp(st.ap_ip, "0.0.0.0") != 0)
+                                ? st.ap_ip : "-";
+        snprintf(ap_line, sizeof(ap_line), "AP 热点: %s · %s", ap_ssid, ap_ip);
+    } else {
+        snprintf(ap_line, sizeof(ap_line), "AP 热点: 未开启");
+    }
+    ha_panel_set_label(s_info_net_ap_label, s_info_net_ap_text, sizeof(s_info_net_ap_text),
+                       ap_line, lv_color_hex(st.ap_active ? HA_COLOR_ON : HA_COLOR_OFF));
 }
 
 static void ha_panel_refresh_info(const app_config_t *cfg)
@@ -894,6 +922,11 @@ static void ha_panel_refresh_info(const app_config_t *cfg)
     ha_panel_set_label(s_info_tts_label, s_info_tts_text, sizeof(s_info_tts_text),
                        tts_text, lv_color_hex(HA_COLOR_TEXT_DIM));
 
+    /* Reply-mode toggle: resync from the persisted value so the on-device button
+     * also reflects changes written from the Web UI. */
+    s_reply_mode_direct = (strcmp(cfg->voice_reply_mode, "direct") == 0);
+    ha_panel_reply_mode_set_label(s_reply_mode_direct);
+
     /* Cache the configured SSID, then refresh the live network rows and the
      * panel-page HA link state from the same freshly-loaded config. */
     strlcpy(s_info_wifi_ssid, cfg->wifi_ssid, sizeof(s_info_wifi_ssid));
@@ -940,6 +973,9 @@ esp_err_t ha_panel_publish_runtime_config(void)
     ha_panel_write_json_field(f, "voice_tts_provider", cfg->voice_tts_provider, false);
     ha_panel_write_json_field(f, "voice_tts_resource_id", cfg->voice_tts_resource_id, false);
     ha_panel_write_json_field(f, "voice_tts_speaker", cfg->voice_tts_speaker, false);
+    ha_panel_write_json_field(f, "voice_volume", cfg->voice_volume, false);
+    ha_panel_write_json_field(f, "voice_reply_mode", cfg->voice_reply_mode, false);
+    ha_panel_write_json_field(f, "voice_tts_stream", cfg->voice_tts_stream, false);
     ha_panel_write_json_field(f, "voice_tts_api_key", cfg->voice_tts_api_key, true);
     fprintf(f, "}\n");
     fclose(f);
@@ -954,6 +990,31 @@ esp_err_t ha_panel_publish_runtime_config(void)
              path, cfg->ha_enabled, cfg->voice_enabled, cfg->voice_wake_enabled);
     free(cfg);
     return ESP_OK;
+}
+
+/* Persist a pending reply-mode toggle to NVS. Called from the panel task
+ * outside the LVGL lock (NVS I/O); returns true when a write happened so the
+ * caller can re-publish the runtime JSON for the Lua skills. */
+static bool ha_panel_commit_reply_mode(void)
+{
+    if (!s_reply_mode_dirty) {
+        return false;
+    }
+    s_reply_mode_dirty = false;
+
+    app_config_t *cfg = heap_caps_calloc(1, sizeof(*cfg), MALLOC_CAP_SPIRAM);
+    if (!cfg) {
+        return false;
+    }
+    if (app_config_load(cfg) == ESP_OK) {
+        strlcpy(cfg->voice_reply_mode, s_reply_mode_direct ? "direct" : "agent",
+                sizeof(cfg->voice_reply_mode));
+        if (app_config_save(cfg) != ESP_OK) {
+            ESP_LOGW(TAG, "failed to persist voice_reply_mode");
+        }
+    }
+    free(cfg);
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -974,8 +1035,28 @@ static void ha_panel_task(void *arg)
             runtime_published = true;   /* publish once the FS is ready */
         }
 
+        /* Settings sliders persist to NVS here (outside the LVGL lock); a
+         * volume change also has to be re-published so the voice Lua TTS plays
+         * the next reply at the new level. */
+        if (ha_panel_settings_commit_pending()) {
+            (void)ha_panel_publish_runtime_config();
+        }
+
+        /* Deferred "网络" work (Wi-Fi scan / STA apply + NVS save) blocks for
+         * seconds, so it runs here with the LVGL lock released; results are
+         * rendered by ha_panel_settings_poll() on a later locked tick. */
+        ha_panel_settings_service();
+
+        /* Voice-page reply-mode toggle persists here too, and needs the runtime
+         * JSON re-published so the Lua skills pick the new chat id (≤1s). */
+        if (ha_panel_commit_reply_mode()) {
+            (void)ha_panel_publish_runtime_config();
+        }
+
         if (ha_panel_lock()) {
             ha_panel_claim_display();
+            /* Live settings content (system load); internally throttled. */
+            ha_panel_settings_poll();
             if (poll_cycle) {
                 ha_panel_poll_voice();
                 /* WiFi state changes without a config write, so poll it live. */
@@ -1087,6 +1168,26 @@ static void ha_panel_build_panel_page(lv_obj_t *page)
     lv_label_set_text(note, "接入 Home Assistant 后,\n此页显示实体与场景。");
 }
 
+static void ha_panel_reply_mode_set_label(bool direct)
+{
+    if (!s_reply_mode_label) {
+        return;
+    }
+    lv_label_set_text_fmt(s_reply_mode_label, "模式: %s", direct ? "直答" : "智能体");
+    lv_obj_set_style_text_color(s_reply_mode_label,
+                                lv_color_hex(direct ? HA_COLOR_ON : HA_COLOR_TEXT_DIM), 0);
+}
+
+static void ha_panel_reply_mode_cb(lv_event_t *e)
+{
+    (void)e;
+    s_reply_mode_direct = !s_reply_mode_direct;
+    ha_panel_reply_mode_set_label(s_reply_mode_direct);
+    /* The panel task persists to NVS and re-publishes the runtime JSON outside
+     * the LVGL lock (same deferred pattern as the settings sliders). */
+    s_reply_mode_dirty = true;
+}
+
 static void ha_panel_build_voice_page(lv_obj_t *page)
 {
     lv_obj_t *voice = lv_obj_create(page);
@@ -1101,9 +1202,30 @@ static void ha_panel_build_voice_page(lv_obj_t *page)
     lv_obj_set_flex_align(voice, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_clear_flag(voice, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_status_label = lv_label_create(voice);
+    /* Top row: pipeline status (left) + reply-mode toggle (right). */
+    lv_obj_t *top = lv_obj_create(voice);
+    lv_obj_set_width(top, LV_PCT(100));
+    lv_obj_set_height(top, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(top, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(top, 0, 0);
+    lv_obj_set_style_pad_all(top, 0, 0);
+    lv_obj_clear_flag(top, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(top, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    s_status_label = lv_label_create(top);
     lv_label_set_text(s_status_label, "状态: 空闲");
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(HA_COLOR_TEXT_DIM), 0);
+
+    lv_obj_t *mode_btn = lv_button_create(top);
+    lv_obj_set_height(mode_btn, 34);
+    lv_obj_set_style_bg_color(mode_btn, lv_color_hex(HA_COLOR_TABBAR), 0);
+    lv_obj_set_style_shadow_width(mode_btn, 0, 0);
+    lv_obj_set_style_pad_hor(mode_btn, 10, 0);
+    lv_obj_add_event_cb(mode_btn, ha_panel_reply_mode_cb, LV_EVENT_CLICKED, NULL);
+    s_reply_mode_label = lv_label_create(mode_btn);
+    ha_panel_reply_mode_set_label(s_reply_mode_direct);
+    lv_obj_center(s_reply_mode_label);
 
     /* Scrollable conversation history: one bubble per record, newest at the
      * bottom. Transparent container so only the bubbles show against the card;
@@ -1138,6 +1260,8 @@ static void ha_panel_build_info_page(lv_obj_t *page)
     lv_label_set_text(s_info_net_state_label, "连接: 未设置");
     s_info_net_ip_label = ha_panel_make_info_label(net_card, lv_color_hex(HA_COLOR_TEXT_DIM));
     lv_label_set_text(s_info_net_ip_label, "IP 地址: -");
+    s_info_net_ap_label = ha_panel_make_info_label(net_card, lv_color_hex(HA_COLOR_OFF));
+    lv_label_set_text(s_info_net_ap_label, "AP 热点: 未开启");
 
     /* LLM: configured flag + configured model. */
     lv_obj_t *llm_card = ha_panel_make_info_card(page, "LLM");
@@ -1259,6 +1383,10 @@ static void ha_panel_build_ui(void)
     ha_panel_build_info_page(s_pages[HA_PAGE_INFO]);
 
     ha_panel_build_tabbar(screen);
+
+    /* Settings overlay (header button + volume/brightness/system-load menus).
+     * Built last so it paints on top of the tab bar and pages. */
+    ha_panel_settings_attach(header, screen);
 
     lv_screen_load(screen);
     ha_panel_show_page(HA_PAGE_PANEL);

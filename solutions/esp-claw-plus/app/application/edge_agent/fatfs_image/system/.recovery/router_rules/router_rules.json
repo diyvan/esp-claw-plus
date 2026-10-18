@@ -25,6 +25,31 @@
     ]
   },
   {
+    "id": "voice_reply_run_script_direct",
+    "description": "Direct reply mode voice route (chat_id=voice_llm); see ADR 0001.",
+    "enabled": true,
+    "consume_on_match": true,
+    "ack": "voice reply dispatched",
+    "match": {
+      "source_cap": "claw_core",
+      "event_type": "out_message",
+      "content_type": "text",
+      "chat_id": "voice_llm"
+    },
+    "actions": [
+      {
+        "type": "run_script",
+        "input": {
+          "async": true,
+          "path": "/system/skills/voice/scripts/voice_reply.lua",
+          "args": {
+            "text": "{{event.text}}"
+          }
+        }
+      }
+    ]
+  },
+  {
     "id": "startup_voice_ptt",
     "description": "Start the persistent BOOT-key push-to-talk loop after boot.",
     "enabled": true,

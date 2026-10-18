@@ -377,7 +377,7 @@ index 78d9415..f92c288 100644
 +/* voice 渠道: 浏览器/IM 渠道回复会被 TTS 朗读并播放, 过度冗长会显著拉长首字延迟,
 + * 故对 chat_id = "voice" 的请求追加「简短口语化」约束 (见 docs/voice-integration.md)。 */
 +#define CLAW_CORE_VOICE_CHAT_ID "voice"
-+#define CLAW_CORE_VOICE_REPLY_MAX_CHARS 80
++#define CLAW_CORE_VOICE_REPLY_MAX_CHARS 200
 +
  static char *build_current_turn_prompt(const claw_core_request_t *request)
  {

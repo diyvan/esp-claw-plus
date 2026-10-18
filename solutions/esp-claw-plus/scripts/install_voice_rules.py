@@ -53,20 +53,33 @@ def wait_for_prompt(port, timeout_s):
     return False
 
 
-def send_command(port, line, wait_s=6.0):
-    port.reset_input_buffer()
-    port.write((line + "\r\n").encode())
-    port.flush()
+def send_command(port, line, wait_s=6.0, retries=4):
+    # 逐字节慢速下发: 设备控制台在忙(持续打印日志)时会丢/拆长输入行, 导致长规则的 JSON
+    # 被截断而报 "invalid rule_json structure" 或 "Unrecognized command"。逐字节 + 小幅
+    # 延时给 RX 队列留出排空时间; 若仍失败(响应里出现损坏特征)则重试。
+    payload = (line + "\r\n").encode()
+    text = ""
+    for attempt in range(retries):
+        port.reset_input_buffer()
+        for byte in payload:
+            port.write(bytes([byte]))
+            port.flush()
+            time.sleep(0.004)
 
-    deadline = time.time() + wait_s
-    buf = bytearray()
-    while time.time() < deadline:
-        chunk = port.read(4096)
-        if chunk:
-            buf.extend(chunk)
-            if PROMPT in bytes(buf):
-                break
-    return buf.decode("utf-8", errors="replace")
+        deadline = time.time() + wait_s
+        buf = bytearray()
+        while time.time() < deadline:
+            chunk = port.read(4096)
+            if chunk:
+                buf.extend(chunk)
+                if PROMPT in bytes(buf):
+                    break
+        text = buf.decode("utf-8", errors="replace")
+        low = text.lower()
+        if "unrecognized command" not in low and "invalid rule_json" not in low:
+            return text
+        time.sleep(0.3)
+    return text
 
 
 def main():

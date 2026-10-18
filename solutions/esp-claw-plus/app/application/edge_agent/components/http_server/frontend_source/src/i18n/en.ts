@@ -248,6 +248,11 @@ export const en = {
   voiceEnable: 'Enable Voice Assistant',
   voiceEnableHint:
     'When off, push-to-talk and the wake word are disabled, and the on-device Voice page is hidden. Takes effect immediately.',
+  voiceReplyMode: 'Reply Mode',
+  voiceReplyModeHint:
+    'Agent uses tools and memory for capable answers; Direct skips tools/memory for a single, faster LLM round-trip. Takes effect on the next voice turn.',
+  voiceReplyModeAgent: 'Agent (tools + memory)',
+  voiceReplyModeDirect: 'Direct (fast, single round-trip)',
   voiceWakeSection: 'Wake Word',
   voiceWakeEnable: 'Enable Wake Word',
   voiceWakeHint:
@@ -266,6 +271,14 @@ export const en = {
   voiceProviderHint:
     'Volcano Engine uses streaming ASR 2.0 (WebSocket, text appears while speaking) and streaming TTS. Requires the new-console API key (X-Api-Key). Leave endpoint / resource ID blank for official defaults.',
   voiceTtsSection: 'Speech Synthesis (TTS)',
+  voiceTtsEngine: 'TTS Engine',
+  voiceTtsEngineHint:
+    'Cloud TTS sounds better but needs a network round-trip; local TTS synthesizes on-device for the lowest time-to-first-audio (Chinese only, fixed voice, streaming playback only).',
+  voiceTtsEngineCloud: 'Cloud TTS',
+  voiceTtsEngineLocal: 'Local TTS',
+  voiceTtsStream: 'Stream Reply Audio',
+  voiceTtsStreamHint:
+    'When on, TTS starts playing each sentence while the LLM reply is still streaming, lowering time-to-first-audio. Takes effect on the next voice turn.',
   voiceTtsProvider: 'TTS Provider',
   voiceTtsUrl: 'TTS Endpoint',
   voiceTtsUrlPlaceholder: 'http://example.com/v1/audio/speech',

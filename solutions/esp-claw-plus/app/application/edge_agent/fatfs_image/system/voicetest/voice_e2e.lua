@@ -14,8 +14,9 @@
 --   ASR=OK text=<识别文本>                    识别成功
 --   ASR=FAILED reason=<中文>                  识别失败
 --   SENTENCE[<n>] text=<句子>                 切出待播句子
---   PLAY[<n>] start=<ms> done=<ms>            该句从起播到播完的耗时
---   RESULT=OK sentences=<n> first_play=<ms> total=<ms>
+--   APPEND[<n>] at=<ms>                       该句追加进流式流水线的时刻 (首句即建立会话)
+--   PLAY_END at=<ms>                          整段音频连续播完的时刻 (单条播放, 句间不重建)
+--   RESULT=OK sentences=<n> first_play=<ms> play_end=<ms> total=<ms>
 --   RESULT=<NO_REPLY|NO_TTS|PLAYER_FAILED|TIMEOUT|SAMPLE_MISSING|BAD_WAV|ASR_FAILED>
 --
 -- provider 位于 /system/skills/voice/scripts, 不在本脚本目录内, 故手动补 package.path。
@@ -33,26 +34,17 @@ local bm = require("board_manager")
 local ep = require("event_publisher")
 local tts = require("voice_tts")
 local vc = require("voice_common")
+local vstream = require("voice_stream")
 
 local TAG = "[voice_e2e]"
 local SAMPLE = "/system/voicetest/asr_sample.wav"
 local CHUNK_MS = 60                 -- 与 voice_ptt 边录边发节奏一致
 local ASR_FINISH_TIMEOUT_MS = 8000
-local REPLY_TIMEOUT_MS = 30000      -- 注入 Agent 后等待/播报的总上限
+local REPLY_TIMEOUT_MS = 180000     -- 注入 Agent 后等待/播报的总上限 (agent 模式常有多次 tool_call, 放宽)
 local POLL_MS = 20
 
-local STREAM_FILE = "voice_stream.txt"
-local STREAM_END_MARKER = "\1\1" .. "END" .. "\1\1"
 local VOICE_CHANNEL = "voice"
 local VOICE_CHAT_ID = "voice"
-
--- 与 voice_ptt 一致的断句参数
-local SOFT_SPLIT_MAX = 40
-local STRONG_TERM = {}
-for _, ch in ipairs({ "。", "！", "？", "!", "?", "；", ";", "\n" }) do
-    STRONG_TERM[ch] = true
-end
-local SOFT_TERM = { ["，"] = true, [","] = true, ["、"] = true, ["："] = true, [":"] = true }
 
 -- 读取运行配置 (与 voice_ptt 同一来源, 保证测的就是真机实际用的那份配置)。
 local function load_cfg()
@@ -103,53 +95,8 @@ local function parse_wav(bytes)
              rate = fmt.rate, channels = fmt.channels, bits = fmt.bits }
 end
 
-local function stream_path()
-    return storage.join_path(storage.get_root_dir(), STREAM_FILE)
-end
-
--- 读取流式文件: 返回 (可见文本, 是否已结束)。与 voice_ptt 的 read_stream 逻辑一致。
-local function read_stream()
-    local path = stream_path()
-    if not storage.exists(path) then
-        return "", false
-    end
-    local ok, content = pcall(storage.read_file, path)
-    if not ok or type(content) ~= "string" then
-        return "", false
-    end
-    local p = content:find("\1\1", 1, true)
-    if p then
-        local tail = content:sub(p, p + #STREAM_END_MARKER - 1)
-        return content:sub(1, p - 1), tail == STREAM_END_MARKER
-    end
-    return content, false
-end
-
 local function trim(s)
     return (s:gsub("^%s+", ""):gsub("%s+$", ""))
-end
-
--- 从缓冲取一句: 与 voice_ptt 的 next_sentence 一致。
-local function next_sentence(buf, flush)
-    if buf == "" then
-        return nil, buf
-    end
-    for i = 1, #buf do
-        if STRONG_TERM[buf:sub(i, i)] then
-            return buf:sub(1, i), buf:sub(i + 1)
-        end
-    end
-    if #buf >= SOFT_SPLIT_MAX then
-        for i = #buf, 1, -1 do
-            if SOFT_TERM[buf:sub(i, i)] then
-                return buf:sub(1, i), buf:sub(i + 1)
-            end
-        end
-    end
-    if flush then
-        return buf, ""
-    end
-    return nil, buf
 end
 
 -- 用录音文件跑一遍流式 ASR, 返回识别文本 (失败返回 nil, reason)。
@@ -210,36 +157,23 @@ local function make_player()
     return player, out
 end
 
--- 一句「边收边播」: 递交流式请求并阻塞到该句播完。返回 (played, start_ms, done_ms, reason)。
-local function play_one(cfg, sentence, player)
+-- 提交一句到分句流水线: 首句 play_stream() 建立会话, 后续句 play_stream_append() 追加到
+-- 同一会话 (音频在底层环形缓冲中首尾相接, 句间无静音断层)。返回 (ok, reason)。
+local function submit_sentence(cfg, sentence, player, started)
     local req, reason = tts.stream_request(cfg, sentence)
     if not req then
-        return false, nil, nil, reason or "no stream request"
+        return false, reason or "no stream request"
     end
-    local t0 = system.millis()
-    local submitted = player:play_stream(req)
-    if not submitted then
-        return false, nil, nil, "play_stream submit failed"
+    local ok
+    if started then
+        ok = player:play_stream_append(req)
+    else
+        ok = player:play_stream(req)
     end
-    local saw_running = false
-    local start_ms = nil
-    while true do
-        local st = player:poll()
-        local running = (st and st.running) and true or false
-        if running then
-            saw_running = true
-            if not start_ms then
-                start_ms = system.millis() - t0
-            end
-        elseif saw_running then
-            break
-        end
-        if system.millis() - t0 > REPLY_TIMEOUT_MS then
-            return false, start_ms, nil, "sentence play timeout"
-        end
-        delay.delay_ms(POLL_MS)
+    if not ok then
+        return false, (started and "play_stream_append failed" or "play_stream submit failed")
     end
-    return true, start_ms, system.millis() - t0
+    return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -263,12 +197,15 @@ end
 print(string.format("%s sample %dHz/%dch/%dbit pcm=%d bytes",
     TAG, wav.rate, wav.channels, wav.bits, #wav.pcm))
 
+print(string.format("%s timing: asr_start t=%d", TAG, system.millis()))
 local text, asr_err = run_asr(cfg, wav)
 if not text then
+    print(string.format("%s timing: asr_done t=%d ok=0", TAG, system.millis()))
     print(TAG .. " ASR=FAILED reason=" .. tostring(asr_err))
     print(TAG .. " RESULT=ASR_FAILED")
     return
 end
+print(string.format("%s timing: asr_done t=%d ok=1", TAG, system.millis()))
 print(TAG .. " ASR=OK text=" .. text)
 
 local player, out = make_player()
@@ -276,13 +213,14 @@ if not player then
     print(TAG .. " RESULT=PLAYER_FAILED")
     return
 end
-if type(player.play_stream) ~= "function" then
-    print(TAG .. " RESULT=NO_PLAY_STREAM (firmware lacks player:play_stream)")
+if type(player.play_stream) ~= "function" or type(player.play_stream_append) ~= "function"
+   or type(player.play_stream_finish) ~= "function" then
+    print(TAG .. " RESULT=NO_PLAY_STREAM (firmware lacks player:play_stream pipeline)")
     return
 end
 
 -- 清掉上一轮残留, 再注入, 避免读到旧内容。
-pcall(storage.remove, stream_path())
+vstream.reset(storage.get_root_dir())
 pcall(storage.remove, storage.join_path(storage.get_root_dir(), "voice_interrupt"))
 
 -- 屏幕桥: 自测基线先清空会话记录, 再写入本轮用户文本 (与 voice_ptt 的 log_user 同款)。
@@ -295,6 +233,7 @@ local STATUS_PROBE = "recognizing|e2e-probe"
 vc.set_status("recognizing", "e2e-probe")
 
 local t_inject = system.millis()
+print(string.format("%s timing: inject t=%d", TAG, t_inject))
 ep.publish_message({
     source_cap = "lua_script",
     channel = VOICE_CHANNEL,
@@ -303,34 +242,41 @@ ep.publish_message({
 })
 print(TAG .. " injected into agent: " .. text)
 
-local consumed = 0
-local buf = ""
 local queue = {}
-local ended = false
 local n = 0
 local first_play_ms = nil
+local t_first_stream = nil
 local fail_reason = nil
-local raw = ""                       -- 流式文件里累计的完整可见文本 (用于断言上屏)
+local raw = ""                       -- 句子拼接 = 完整可见文本 (切句不丢字符), 用于断言上屏
+local stream_started = false         -- 首句已建立流式流水线会话
+local finish_sent = false            -- 已通知流水线不再追加
+local play_end_ms = nil              -- 整段音频播完 (player 停止) 的时刻
 
+-- 消费 /fatfs/voice_stream.txt: 包一层默认读源以记录「首次出现可见文本」的时刻 (first_stream
+-- 计时), 其余整读差分 + 切句全部交给 voice_stream。
+local base_read = vstream.file_read
+local root_dir = storage.get_root_dir()
+local function observed_read()
+    local vis, done = base_read(root_dir)
+    if not t_first_stream and #vis > 0 then
+        t_first_stream = system.millis()
+        print(string.format("%s timing: first_stream t=%d delta=%d bytes=%d",
+            TAG, t_first_stream, t_first_stream - t_inject, #vis))
+    end
+    return vis, done
+end
+local stream = vstream.consumer({ read = observed_read })
+
+-- 主循环: 边切句边追加进同一条 TTS 流水线, 直到文本流结束。
 while true do
-    if not ended then
-        local vis, done = read_stream()
-        if #vis > consumed then
-            buf = buf .. vis:sub(consumed + 1)
-            consumed = #vis
-            raw = vis
+    while true do
+        local sentence = stream:next()
+        if not sentence then
+            break
         end
-        local sentence
-        repeat
-            sentence, buf = next_sentence(buf, done)
-            if sentence then
-                vc.log_agent_append(sentence)
-                queue[#queue + 1] = sentence
-            end
-        until not sentence
-        if done then
-            ended = true
-        end
+        vc.log_agent_append(sentence)
+        queue[#queue + 1] = sentence
+        raw = raw .. sentence
     end
 
     while #queue > 0 do
@@ -340,19 +286,25 @@ while true do
             print(string.format("%s SENTENCE[%d] text=%s", TAG, n, sentence))
             if not first_play_ms then
                 first_play_ms = system.millis() - t_inject
+                print(string.format("%s timing: first_sentence t=%d delta=%d", TAG,
+                    system.millis(), first_play_ms))
             end
-            local played, start_ms, done_ms, reason = play_one(cfg, sentence, player)
-            if played then
-                print(string.format("%s PLAY[%d] start=%sms done=%sms", TAG, n,
-                    tostring(start_ms), tostring(done_ms)))
+            local ok, reason = submit_sentence(cfg, sentence, player, stream_started)
+            if ok then
+                print(string.format("%s APPEND[%d] at=%dms", TAG, n, system.millis() - t_inject))
+                stream_started = true
             else
                 fail_reason = reason
-                print(string.format("%s PLAY[%d] FAILED reason=%s", TAG, n, tostring(reason)))
+                print(string.format("%s APPEND[%d] FAILED reason=%s", TAG, n, tostring(reason)))
             end
         end
     end
 
-    if ended then
+    if stream:finished() then
+        if stream_started and not finish_sent then
+            player:play_stream_finish()
+            finish_sent = true
+        end
         break
     end
     if system.millis() - t_inject > REPLY_TIMEOUT_MS then
@@ -363,6 +315,28 @@ while true do
     delay.delay_ms(POLL_MS)
 end
 
+-- 等待流水线把整段音频连续播完 (单条播放, 句间不重建 player / 不重连)。
+if stream_started then
+    local saw_running = false
+    while true do
+        local st = player:poll()
+        local running = (st and st.running) and true or false
+        if running then
+            saw_running = true
+        elseif saw_running then
+            break
+        end
+        if system.millis() - t_inject > REPLY_TIMEOUT_MS then
+            fail_reason = fail_reason or "playback timeout"
+            print(TAG .. " TIMEOUT waiting for playback end")
+            break
+        end
+        delay.delay_ms(POLL_MS)
+    end
+    play_end_ms = system.millis() - t_inject
+    print(string.format("%s PLAY_END at=%dms finish=%s", TAG, play_end_ms, tostring(finish_sent)))
+end
+
 pcall(function() player:close() end)
 pcall(function() out:close() end)
 
@@ -370,11 +344,11 @@ local total = system.millis() - t_inject
 if n == 0 then
     print(TAG .. " RESULT=NO_REPLY")
 elseif fail_reason then
-    print(string.format("%s RESULT=PARTIAL sentences=%d first_play=%sms total=%dms reason=%s",
-        TAG, n, tostring(first_play_ms), total, tostring(fail_reason)))
+    print(string.format("%s RESULT=PARTIAL sentences=%d first_play=%sms play_end=%sms total=%dms reason=%s",
+        TAG, n, tostring(first_play_ms), tostring(play_end_ms), total, tostring(fail_reason)))
 else
-    print(string.format("%s RESULT=OK sentences=%d first_play=%sms total=%dms",
-        TAG, n, tostring(first_play_ms), total))
+    print(string.format("%s RESULT=OK sentences=%d first_play=%sms play_end=%sms total=%dms",
+        TAG, n, tostring(first_play_ms), tostring(play_end_ms), total))
 end
 
 -- 上屏断言: 面板气泡来自 /fatfs/voice_log.txt 的 A(助手) 记录 (由 vc.log_agent_append 逐句写入),
