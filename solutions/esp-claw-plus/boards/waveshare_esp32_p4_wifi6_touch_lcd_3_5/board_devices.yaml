@@ -60,7 +60,10 @@ devices:
         ldo_chan_id: 4
 
   # Buttons (GPIO-based, active low)
-  # BOOT 按键接 P4 strapping 引脚 GPIO35; PWR/RST 非可编程 GPIO
+  # BOOT 按键接 P4 strapping 引脚 GPIO35; RST 为硬件复位, 非 GPIO。
+  # PWR 按键经 BSS138 电平转换接到 GPIO49, 高电平有效(按下=1); AXP2101 的
+  # PWRON 与它并联, 长按 6s 由 PMIC 直接关机。GPIO49 由 ha_panel 轮询做待机开关,
+  # 本设备条目保持 init_skip 不接管(避免与 ha_panel 抢同一个引脚)。
   - name: buttons
     chip: gpio_button
     type: custom

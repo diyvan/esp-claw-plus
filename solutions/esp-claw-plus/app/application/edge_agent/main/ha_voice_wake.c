@@ -54,18 +54,8 @@ static srmodel_list_t *s_models;
 /* Optional wake-event sink (the panel registers it to jump to the voice page). */
 static ha_voice_wake_event_cb_t s_event_cb;
 
-/* Downmix stereo -> mono, then box-decimate by DECIM_FACTOR (48k -> 16k). */
-static void mic_downmix_decimate(const int16_t *raw, int out_samples, int16_t *out)
-{
-    for (int i = 0; i < out_samples; i++) {
-        int32_t acc = 0;
-        for (int k = 0; k < DECIM_FACTOR; k++) {
-            const int16_t *frame = &raw[(i * DECIM_FACTOR + k) * MIC_CHANNELS];
-            acc += ((int32_t)frame[0] + (int32_t)frame[1]) / MIC_CHANNELS;
-        }
-        out[i] = (int16_t)(acc / DECIM_FACTOR);
-    }
-}
+/* Downmix stereo -> mono, then box-decimate by DECIM_FACTOR (48k -> 16k), via
+ * the helper shared with the Lua recording path (ha_voice_arbiter). */
 
 static void ha_voice_wake_publish_trigger(void)
 {
@@ -211,7 +201,7 @@ static void ha_voice_wake_task(void *arg)
                 ESP_LOGW(TAG, "codec read failed");
                 break;
             }
-            mic_downmix_decimate(raw, feed, mono);
+            ha_voice_pcm_downmix_decimate(raw, feed, MIC_CHANNELS, DECIM_FACTOR, mono);
             /* TEMP DEBUG: mic liveness / level probe. */
             for (int i = 0; i < feed; i++) {
                 int v = mono[i];

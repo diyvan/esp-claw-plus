@@ -23,11 +23,20 @@ ASR 转文本后注入 Agent, Agent 的回复再经 TTS 播放。
   `MIN_RECORD_MS`~`MAX_RECORD_MS` 之间的音频写成 `/fatfs/voice_ptt.wav`, 转文本后经
   `event_publisher.publish_message` 注入, 渠道 `voice` / 会话 `voice`。
 - `scripts/voice_reply.lua` — 回复播报。由路由规则调用, 回复文本在 `args.text`。
-  真实 TTS: 把文本 POST 给云 TTS, 响应音频落盘后异步播放; 播放期间轮询打断标志
-  `/fatfs/voice_interrupt`, 命中即停止 (语音打断 / barge-in)。
+  真实 TTS: 把文本 POST 给云 TTS, 响应音频落盘后异步播放 (播放统一走 `voice_playback`);
+  播放期间轮询打断标志 `/fatfs/voice_interrupt` 与**轮次闸门** (`voice_round`,
+  用户若已发起新一轮录音即自行放弃), 命中即停止 (语音打断 / barge-in)。
 - `scripts/voice_common.lua` — 共享模块, 是三个 `/fatfs` 约定的**唯一 owner**: 屏幕桥
   (对话文本上屏)、运行时配置桥、语音打断信道。`voice_ptt.lua` / `voice_reply.lua` /
   `voice_e2e.lua` 都 `require("voice_common")` (与调用方同目录, `package.path` 首位即命中)。
+- `scripts/voice_playback.lua` — 共享模块, 是**播放约定的唯一 owner**: 取板级 DAC 参数、开
+  输出 (`playback.open(cfg)`)、惰性建 player、流式会话 (`play_stream` / `play_stream_append`
+  / `play_stream_finish`)、落盘 `play_file(path)`、`poll()` 推进收尾、`stop()` 打断、`close()`
+  释放。`voice_ptt.lua` (逐句流水线) 与 `voice_reply.lua` (整段回退) 都经它播放, 不再各写一份。
+- `scripts/voice_round.lua` — 共享模块, 是**轮次闸门 (round gate)** 的唯一 owner: 每次用户
+  开始说话 (PTT 按下 / 唤醒) 由 `voice_ptt.lua` 调 `round.begin()` 递增轮次号并落盘
+  `/fatfs/voice_round`; 异步回复脚本 `round.id()` 记下进入时的号, 用 `round.is_current(rid)`
+  判断自己是否已被新一轮取代 (过期即不起播/停播), 避免插播过期语音。
 - `scripts/voice_stream.lua` — 共享模块, 是 `voice_stream.txt` **流式回复桥** (文件名 / 结束
   哨兵 `\1\1END\1\1` / 整读差分 / 按标点切句) 的**唯一 owner**。`voice_ptt.lua` (逐句播报) 与
   `voicetest/voice_e2e.lua` (自测) 都 `require("voice_stream")`: `consumer({root_dir=?, read=?})`
@@ -136,10 +145,18 @@ ASR 适配器若导出 `open` 则走**流式会话** (边说边发、增量上�
 
 ## 语音打断 (barge-in)
 
-跨脚本唯一可行的信道是 `/fatfs` 文件 (音频无全局仲裁器): 用户按下 BOOT 或唤醒命中时,
-`voice_ptt.lua` 经 `voice_common.signal_interrupt()` 写 `/fatfs/voice_interrupt` 空标志;
-`voice_reply.lua` 播放中每 20ms 经 `voice_common.interrupt_requested()` 轮询, 见到标志即
-`player:stop()` 并清标志, 实现"说话即打断 TTS"。标志文件的读写统一由 `voice_common` 承载。
+跨脚本唯一可行的信道是 `/fatfs` 文件 (音频无全局仲裁器), 有两条互补的信道:
+
+- **轮次闸门** (`voice_round`): 用户开始说话时 `voice_ptt.lua` 调 `round.begin()` 递增轮次号;
+  `voice_reply.lua` 记下进入时的轮次号, 起播前与播放中都用 `round.is_current()` 判断自己是否
+  已被新一轮取代 —— 过期就不起播/停播。这是**语义归属**判定, 不依赖"标志是否被及时清掉"。
+- **打断标志** (`voice_interrupt`): 用户按下 BOOT 或唤醒命中时, `voice_ptt.lua` 经
+  `voice_common.signal_interrupt()` 写空标志; `voice_reply.lua` 播放中每 20ms 经
+  `voice_common.interrupt_requested()` 轮询, 见到标志即 `player:stop()` 并清标志。这是**立即停音**
+  的边沿信号。标志文件的读写统一由 `voice_common` 承载。
+
+设备级所有权 (录音到来时如何撤销正在写扬声器的 writer) 由 C 侧 `ha_voice_arbiter` 兜底,
+见 `docs/adr/0003-audio-device-owner.md`; 轮次闸门与播放收敛见 `docs/adr/0004-voice-round-and-playback-owner.md`。
 
 ## 相关技能
 
@@ -165,9 +182,27 @@ Lua<->C 绑定)。字段:
 | `voice_tts_resource_id` | TTS 资源 ID; 留空用 provider 默认 (`seed-tts-2.0`) |
 | `voice_tts_speaker` | TTS 发音人; 留空用 provider 默认 (`zh_female_vv_uranus_bigtts`) |
 | `voice_tts_stream` | 边收边播开关; `true` 时每句回复走 TTS 流式 (`player:play_stream`) 边收边播, 不再整句合成落盘; 默认 `false`; **`voice_tts_provider=local` 时恒为开** |
+| `voice_send_mode` | 发送方式; `auto` (默认) 识别出文本后立即发送, `manual` 进入 `confirming` 态等 BOOT 键确认 (轻点发送 / 按住作废并重录 / 15s 无操作自动作废) |
 | `ha_enabled` / `ha_base_url` / `ha_token` | Home Assistant 开关与接入信息 (M2 意图路由使用) |
 
 配置在网页保存后即时生效, 无需重启 (脚本每 1s 重新读取一次)。
+
+## 发送模式 (voice_send_mode)
+
+`auto` (默认) 与 `manual` 只影响**识别完成后是否立即发送**, 与回复模式 (`voice_reply_mode`)
+正交, 流式 / 批量 ASR 两条路径都适用:
+
+- `auto`: 识别出文本即注入 Agent (`set_wait("thinking")` → 起播流水线)。
+- `manual`: 识别出文本后**不发送**, 转入 `pending` 状态并写状态码 `confirming`, 等 BOOT 键确认:
+
+| 手势 (pending 态下) | 行为 |
+| --- | --- |
+| 轻点 (按住未达 `MANUAL_HOLD_MIN_MS` = 500ms 即松开) | 发送本次识别结果 (与 `auto` 同一套注入 + 播报流程) |
+| 按住 (≥ 500ms) | 作废本次结果并**立即重新录音** (松手后照常收尾 → 再次进入 `pending`) |
+| 无操作 15s (`PENDING_TIMEOUT_MS`) | 自动作废回 `idle`, **不自动发送** |
+
+pending 态下 BOOT 键不再直接起录音: `on_press_down` 只记按下时刻, 由主循环 `pending_step()`
+判定"按住 → 重录"、`on_press_up` 判定"轻点 → 发送"; 超时同样由 `pending_step()` 兜底。
 
 ## 屏幕桥 (状态码 + 对话上屏)
 
@@ -198,6 +233,7 @@ Lua<->C 绑定)。字段:
 | `idle` | 空闲 | 否 |
 | `recording` | 录音中 | 是 |
 | `recognizing` | 识别中 | 是 |
+| `confirming` | 待确认 | 是 |
 | `thinking` | 思考中 | 是 |
 | `synthesizing` | 合成中 | 是 |
 | `speaking` | 播报中 | 是 |
@@ -230,8 +266,8 @@ C 侧读缓冲与快照各 40KB, 分配在 **PSRAM** (内部 RAM 紧张且渲染
 
 **状态反馈**: 每个阶段都把状态码写进 `voice_status.txt` (面板「状态:」行, 非 `idle` 时点亮
 指示灯) 并同步打串口日志, **不再静默回到「空闲」**。流程态写对应 `code` (`recording` /
-`recognizing` / `thinking` / `synthesizing` / `speaking`); 一切失败统一写 `error|<原因>`,
-面板显示「状态: 出错 · <原因>」。各阶段的失败原因:
+`recognizing` / `confirming` / `thinking` / `synthesizing` / `speaking`); 一切失败统一写
+`error|<原因>`, 面板显示「状态: 出错 · <原因>」。各阶段的失败原因:
 
 | 阶段 | 失败原因 (`error` 的 detail) |
 | --- | --- |

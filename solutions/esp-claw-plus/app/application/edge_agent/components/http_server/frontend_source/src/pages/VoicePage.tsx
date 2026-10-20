@@ -14,6 +14,7 @@ type VoiceForm = {
   voice_enabled: boolean;
   voice_wake_enabled: boolean;
   voice_reply_mode: string;
+  voice_send_mode: string;
   voice_asr_provider: string;
   voice_asr_url: string;
   voice_asr_api_key: string;
@@ -51,6 +52,12 @@ function replyModeFromConfig(value: string | undefined): string {
   return value === 'direct' ? 'direct' : 'agent';
 }
 
+// Send mode: "auto" (send as soon as recognition finishes) or "manual" (hold the
+// result until the BOOT key confirms it). Defaults to "auto" when unset.
+function sendModeFromConfig(value: string | undefined): string {
+  return value === 'manual' ? 'manual' : 'auto';
+}
+
 export const VoicePage: Component = () => {
   const tab = createConfigTab<VoiceForm>({
     tab: 'voice',
@@ -59,6 +66,7 @@ export const VoicePage: Component = () => {
       voice_enabled: boolFromConfig(config.voice_enabled, true),
       voice_wake_enabled: boolFromConfig(config.voice_wake_enabled, true),
       voice_reply_mode: replyModeFromConfig(config.voice_reply_mode),
+      voice_send_mode: sendModeFromConfig(config.voice_send_mode),
       voice_tts_stream: boolFromConfig(config.voice_tts_stream, false),
       voice_asr_provider: providerFromConfig(config.voice_asr_provider),
       voice_asr_url: config.voice_asr_url ?? '',
@@ -75,6 +83,7 @@ export const VoicePage: Component = () => {
       voice_enabled: form.voice_enabled ? 'true' : 'false',
       voice_wake_enabled: form.voice_wake_enabled ? 'true' : 'false',
       voice_reply_mode: form.voice_reply_mode,
+      voice_send_mode: form.voice_send_mode,
       voice_tts_stream: form.voice_tts_stream ? 'true' : 'false',
       voice_asr_provider: form.voice_asr_provider,
       voice_asr_url: form.voice_asr_url.trim(),
@@ -113,6 +122,17 @@ export const VoicePage: Component = () => {
             >
               <option value="agent">{t('voiceReplyModeAgent') as string}</option>
               <option value="direct">{t('voiceReplyModeDirect') as string}</option>
+            </SelectInput>
+          </div>
+          <div class="pt-3">
+            <SelectInput
+              label={t('voiceSendMode')}
+              hint={t('voiceSendModeHint')}
+              value={tab.form.voice_send_mode}
+              onChange={(event) => tab.setForm('voice_send_mode', event.currentTarget.value)}
+            >
+              <option value="auto">{t('voiceSendModeAuto') as string}</option>
+              <option value="manual">{t('voiceSendModeManual') as string}</option>
             </SelectInput>
           </div>
         </StaticConfigBlock>

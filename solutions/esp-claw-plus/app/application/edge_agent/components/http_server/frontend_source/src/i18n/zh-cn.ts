@@ -247,6 +247,11 @@ export const zhCn: Dict = {
     '「智能体」使用工具与记忆，回答能力更强；「直答」跳过工具与记忆，直接单次请求 LLM，响应更快。下一轮语音生效。',
   voiceReplyModeAgent: '智能体（工具 + 记忆）',
   voiceReplyModeDirect: '直答（快速、单轮）',
+  voiceSendMode: '发送方式',
+  voiceSendModeHint:
+    '「自动」识别出结果后立即发送；「手动」先保留识别结果，按一下 BOOT 键才发送（按住 BOOT 键则作废并重新录音，15 秒无操作自动作废）。下一轮语音生效。',
+  voiceSendModeAuto: '自动（识别即发送）',
+  voiceSendModeManual: '手动（按 BOOT 确认）',
   voiceWakeSection: '唤醒词',
   voiceWakeEnable: '启用唤醒词',
   voiceWakeHint: '开启后说出唤醒词即开始免提录音；关闭后仅使用按键说话。修改后立即生效。',

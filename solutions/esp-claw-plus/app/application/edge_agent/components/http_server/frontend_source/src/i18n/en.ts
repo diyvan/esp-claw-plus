@@ -253,6 +253,11 @@ export const en = {
     'Agent uses tools and memory for capable answers; Direct skips tools/memory for a single, faster LLM round-trip. Takes effect on the next voice turn.',
   voiceReplyModeAgent: 'Agent (tools + memory)',
   voiceReplyModeDirect: 'Direct (fast, single round-trip)',
+  voiceSendMode: 'Send Mode',
+  voiceSendModeHint:
+    'Auto sends as soon as speech is recognised. Manual keeps the result until you tap the BOOT key to send (hold BOOT to discard and re-record; 15 s of inactivity discards it). Takes effect on the next voice turn.',
+  voiceSendModeAuto: 'Auto (send on recognition)',
+  voiceSendModeManual: 'Manual (confirm with BOOT)',
   voiceWakeSection: 'Wake Word',
   voiceWakeEnable: 'Enable Wake Word',
   voiceWakeHint:

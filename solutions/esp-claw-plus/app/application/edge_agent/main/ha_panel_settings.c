@@ -871,6 +871,16 @@ void ha_panel_settings_poll(void)
     settings_refresh_load();
 }
 
+void ha_panel_settings_set_backlight_enabled(bool enabled)
+{
+    if (!s_built) {
+        return;
+    }
+    /* Off -> duty 0; on -> the level the user last set. Never writes NVS, so
+     * the standby toggle leaves the persisted 亮度 setting alone. */
+    settings_apply_brightness(enabled ? s_brightness_pending : 0);
+}
+
 void ha_panel_settings_service(void)
 {
     set_net_op_t op = s_net_op;

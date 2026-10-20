@@ -53,6 +53,7 @@
 #include "freertos/task.h"
 #include "ha_voice_wake.h"
 #include "ha_panel_settings.h"
+#include "ha_panel_power.h"
 #include "lvgl.h"
 #include "wifi_manager.h"
 
@@ -140,6 +141,12 @@ static bool s_page_enabled[HA_PAGE_COUNT] = { true, true, true };
 /* Set by the wake listener on wake-word detection; the panel task (which owns
  * the LVGL lock) consumes it and jumps to the voice page. */
 static volatile bool s_wake_jump_pending;
+
+/* Standby (screen off) state, toggled by a PWR button click. While set, the
+ * panel task stops rendering - which also drops touch input - and the backlight
+ * is dimmed to 0; the rest of the system (Wi-Fi, voice, wake word) keeps
+ * running. Owned by the panel task. */
+static bool s_standby;
 
 /* Voice mirror UI + last-rendered text, so a poll only touches LVGL on change. */
 static lv_font_t *s_cjk_font;
@@ -487,6 +494,7 @@ static const ha_voice_status_t s_voice_status_map[] = {
     { "idle",         "空闲",   false },
     { "recording",    "录音中", true  },
     { "recognizing",  "识别中", true  },
+    { "confirming",   "待确认", true  },
     { "thinking",     "思考中", true  },
     { "synthesizing", "合成中", true  },
     { "speaking",     "播报中", true  },
@@ -975,6 +983,7 @@ esp_err_t ha_panel_publish_runtime_config(void)
     ha_panel_write_json_field(f, "voice_tts_speaker", cfg->voice_tts_speaker, false);
     ha_panel_write_json_field(f, "voice_volume", cfg->voice_volume, false);
     ha_panel_write_json_field(f, "voice_reply_mode", cfg->voice_reply_mode, false);
+    ha_panel_write_json_field(f, "voice_send_mode", cfg->voice_send_mode, false);
     ha_panel_write_json_field(f, "voice_tts_stream", cfg->voice_tts_stream, false);
     ha_panel_write_json_field(f, "voice_tts_api_key", cfg->voice_tts_api_key, true);
     fprintf(f, "}\n");
@@ -1021,6 +1030,21 @@ static bool ha_panel_commit_reply_mode(void)
 /* Render task                                                        */
 /* ------------------------------------------------------------------ */
 
+/* Enter/leave standby: the panel task stops calling lv_timer_handler() while
+ * s_standby is set (which freezes the UI and ignores touch, since the indev is
+ * only read from there) and the backlight is dimmed. Only the backlight is
+ * touched, so the persisted brightness survives; the LCD keeps the last frame
+ * and shows it again as soon as the backlight comes back on. */
+static void ha_panel_set_standby(bool on)
+{
+    if (s_standby == on) {
+        return;
+    }
+    s_standby = on;
+    ha_panel_settings_set_backlight_enabled(!on);
+    ESP_LOGI(TAG, "%s (PWR click)", on ? "standby: screen off" : "resumed: screen on");
+}
+
 static void ha_panel_task(void *arg)
 {
     (void)arg;
@@ -1028,6 +1052,23 @@ static void ha_panel_task(void *arg)
     bool runtime_published = false;
     while (1) {
         const bool poll_cycle = (tick % HA_VOICE_POLL_CYCLES) == 0;
+        bool wake_jump = false;
+
+        /* PWR button: a single click toggles standby; a long press is ignored
+         * here (the AXP2101's PWRON turns the board off by itself). Polled with
+         * the LVGL lock released - the backlight write does not need it - so the
+         * toggle also works while the screen is off and rendering is skipped. */
+        if (ha_panel_power_poll_press()) {
+            ha_panel_set_standby(!s_standby);
+        }
+
+        /* A wake-word hit always returns to the running mode first, so the reply
+         * is visible even if the panel was in standby. */
+        if (s_wake_jump_pending) {
+            s_wake_jump_pending = false;
+            wake_jump = true;
+            ha_panel_set_standby(false);
+        }
 
         /* Publish outside the LVGL lock: it does NVS + file I/O and only takes
          * the lock internally to refresh the info labels (never re-entered). */
@@ -1055,23 +1096,25 @@ static void ha_panel_task(void *arg)
 
         if (ha_panel_lock()) {
             ha_panel_claim_display();
-            /* Live settings content (system load); internally throttled. */
-            ha_panel_settings_poll();
-            if (poll_cycle) {
-                ha_panel_poll_voice();
-                /* WiFi state changes without a config write, so poll it live. */
-                ha_panel_refresh_network();
+            /* In standby the screen is off: skipping lv_timer_handler() freezes
+             * the UI and with it touch handling, and the periodic timers simply
+             * catch up (they are not queued) on the first tick after resume. */
+            if (!s_standby) {
+                /* Live settings content (system load); internally throttled. */
+                ha_panel_settings_poll();
                 /* On a wake-word hit, bring the voice page to front (only when
                  * voice is enabled, i.e. the page exists). */
-                if (s_wake_jump_pending) {
-                    s_wake_jump_pending = false;
-                    if (s_page_enabled[HA_PAGE_VOICE] && s_page != HA_PAGE_VOICE) {
-                        ha_panel_show_page(HA_PAGE_VOICE);
-                        ESP_LOGI(TAG, "wake detected -> jumped to voice page");
-                    }
+                if (wake_jump && s_page_enabled[HA_PAGE_VOICE] && s_page != HA_PAGE_VOICE) {
+                    ha_panel_show_page(HA_PAGE_VOICE);
+                    ESP_LOGI(TAG, "wake detected -> jumped to voice page");
                 }
+                if (poll_cycle) {
+                    ha_panel_poll_voice();
+                    /* WiFi state changes without a config write, so poll it live. */
+                    ha_panel_refresh_network();
+                }
+                lv_timer_handler();
             }
-            lv_timer_handler();
             ha_panel_unlock();
         }
         tick++;
@@ -1518,6 +1561,13 @@ esp_err_t ha_panel_start(void)
     BaseType_t ok = xTaskCreate(ha_panel_task, "ha_panel", HA_PANEL_TASK_STACK, NULL,
                                 HA_PANEL_TASK_PRIO, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "create panel task failed");
+
+    /* PWR button standby toggle. Non-fatal: without it the panel just never
+     * enters standby. */
+    esp_err_t pwr_err = ha_panel_power_init();
+    if (pwr_err != ESP_OK) {
+        ESP_LOGW(TAG, "PWR key init failed: %s", esp_err_to_name(pwr_err));
+    }
 
     /* Jump to the voice page whenever the wake word fires (wake only, not PTT). */
     ha_voice_wake_set_callback(ha_panel_on_wake_event);

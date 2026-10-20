@@ -1,0 +1,166 @@
+diff --git a/components/claw_capabilities/cap_tts_stream/src/cap_tts_stream.c b/components/claw_capabilities/cap_tts_stream/src/cap_tts_stream.c
+index e681cc7..c14f6f6 100644
+--- a/components/claw_capabilities/cap_tts_stream/src/cap_tts_stream.c
++++ b/components/claw_capabilities/cap_tts_stream/src/cap_tts_stream.c
+@@ -10,6 +10,7 @@
+ #include <string.h>
+ 
+ #include "cJSON.h"
++#include "esp_attr.h"
+ #include "esp_crt_bundle.h"
+ #include "esp_heap_caps.h"
+ #include "esp_http_client.h"
+@@ -19,7 +20,6 @@
+ #include "esp_tts.h"
+ #include "esp_tts_voice_xiaole.h"
+ #include "freertos/FreeRTOS.h"
+-#include "freertos/idf_additions.h"
+ #include "freertos/semphr.h"
+ #include "freertos/stream_buffer.h"
+ #include "freertos/task.h"
+@@ -34,6 +34,7 @@ static const char *TAG = "tts_stream";
+ #define TTS_STREAM_DEFAULT_TO_MS 20000
+ #define TTS_STREAM_SEND_TO_MS    1000
+ #define TTS_STREAM_POLL_MS       200
++#define TTS_STREAM_SB_LOCK_TO_MS 1000
+ #define TTS_STREAM_MAX_SEGMENTS  8
+ 
+ /* 本地 TTS 语音数据分区 (由 CMake esptool_py_flash_to_partition 烧入 .dat)。 */
+@@ -86,6 +87,34 @@ typedef struct {
+ 
+ static tts_stream_ctx_t s_ctx;
+ 
++/* 环形缓冲 sb 的「读取 ↔ 重置」串行化锁。
++ * 读取方是 esp_audio_simple_player 的 GMF 解码任务 (cap_tts_stream_read), 重置方是 Lua 任务
++ * (cap_tts_stream_end)。只靠 abort 标志不够: 读取方可能已通过检查、正阻塞在
++ * xStreamBufferReceive 里, 此时对同一队列做 xStreamBufferReset 会破坏其内部游标。
++ * 锁用静态存储常驻 (若与被保护对象同生命周期销毁, 竞态会原样重现); 只在读取/重置的临界区内
++ * 短暂持有 (读取侧受接收超时约束), 不跨越长阻塞。 */
++static StaticSemaphore_t s_sb_lock_buf;
++static SemaphoreHandle_t s_sb_lock;
++
++static SemaphoreHandle_t tts_stream_sb_lock(void)
++{
++    if (!s_sb_lock) {
++        s_sb_lock = xSemaphoreCreateMutexStatic(&s_sb_lock_buf);
++    }
++    return s_sb_lock;
++}
++
++/* 环形缓冲常驻 (启动期静态占用, 与堆彻底解耦)。
++ * 历史实现每次会话 heap 分配/释放 48KB PSRAM, 在 e2e 收尾偶发
++ * "assert failed: tlsf_free ... block already marked as free" (崩溃前堆自洽, 非本模块二次释放:
++ * DIAG 实测 last_freed=0、无并发 end) —— 即该块在释放前已被堆上其他活动 (GMF 解码器 / TLS 缓冲
++ * 的分配释放造成的地址复用、或相邻块越界写坏块头) 波及。改为静态占用后: 无 per-session 分配/释放,
++ * 也不存在被陈旧指针误释放或被邻居越界写坏块头的可能; 会话间仅 xStreamBufferReset 清空。
++ * 缓冲只做 CPU 搬运、不参与 DMA, 放 PSRAM 足够 (内部 RAM 早已无 48KB 连续块)。
++ * +1: FreeRTOS 静态流缓冲要求存储区 >= xBufferSizeBytes + 1。 */
++static EXT_RAM_BSS_ATTR uint8_t s_sb_storage[TTS_STREAM_SB_BYTES + 1];
++static StaticStreamBuffer_t s_sb_struct;
++
+ /* 本地 TTS (esp-tts) 状态: 首次使用时懒加载, 之后常驻复用 (mmap 不占 RAM,
+  * voice set / handle 保持存活可省掉每次会话的初始化耗时, 服务于"压低首字延迟"的目标)。 */
+ static esp_tts_handle_t s_tts;
+@@ -578,28 +607,18 @@ static void tts_stream_task(void *arg)
+     vTaskDelete(NULL);
+ }
+ 
+-/* 环形缓冲优先内部 RAM, 拿不到连续 48KB 时退到 PSRAM。
+- * 常驻 WakeNet/AFE + WiFi(esp_hosted) + 音频解码器起后, 内部 RAM 往往已无 48KB 连续块
+- * (现象: "tts_stream: resource create failed", 见 docs/voice-integration.md §7.4)。
+- * 该缓冲只做 CPU 搬运、不参与 DMA, 放 PSRAM 完全够用。 */
+-static StreamBufferHandle_t tts_stream_sb_create(void)
++/* 创建 (仅首次) 常驻环形缓冲并返回句柄; 之后每次会话复用同一实例。 */
++static StreamBufferHandle_t tts_stream_sb_ensure(void)
+ {
+-    StreamBufferHandle_t sb = xStreamBufferCreateWithCaps(
+-        TTS_STREAM_SB_BYTES, 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+-    if (sb) {
+-        ESP_LOGI(TAG, "stream buffer: internal RAM (%d bytes)", TTS_STREAM_SB_BYTES);
+-        return sb;
+-    }
+-    size_t largest_int = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+-    sb = xStreamBufferCreateWithCaps(TTS_STREAM_SB_BYTES, 1, MALLOC_CAP_SPIRAM);
+-    if (sb) {
+-        ESP_LOGW(TAG, "stream buffer: PSRAM fallback (largest internal block=%zu)", largest_int);
+-        return sb;
+-    }
+-    ESP_LOGE(TAG, "stream buffer create failed: free=%u largest_int=%zu largest_psram=%zu",
+-             (unsigned)esp_get_free_heap_size(), largest_int,
+-             heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+-    return NULL;
++    if (!s_ctx.sb) {
++        s_ctx.sb = xStreamBufferCreateStatic(TTS_STREAM_SB_BYTES, 1, s_sb_storage, &s_sb_struct);
++        if (s_ctx.sb) {
++            ESP_LOGI(TAG, "stream buffer: static %d bytes", TTS_STREAM_SB_BYTES);
++        } else {
++            ESP_LOGE(TAG, "stream buffer create failed (static)");
++        }
++    }
++    return s_ctx.sb;
+ }
+ 
+ /* 建立会话并投递首段 (成功时 first 的所有权转移给流水线队列)。 */
+@@ -623,7 +642,7 @@ static esp_err_t tts_stream_begin_common(tts_stream_seg_t *first)
+ 
+     s_ctx.lock = xSemaphoreCreateMutex();
+     s_ctx.item_sem = xSemaphoreCreateCounting(TTS_STREAM_MAX_SEGMENTS, 0);
+-    s_ctx.sb = tts_stream_sb_create();
++    s_ctx.sb = tts_stream_sb_ensure();
+     if (!s_ctx.lock || !s_ctx.item_sem || !s_ctx.sb) {
+         ESP_LOGE(TAG, "resource create failed: lock=%p item_sem=%p sb=%p free=%u largest_int=%u",
+                  s_ctx.lock, s_ctx.item_sem, s_ctx.sb,
+@@ -731,6 +750,7 @@ void cap_tts_stream_finish(void)
+ int cap_tts_stream_read(uint8_t *data, int size, uint32_t timeout_ms)
+ {
+     size_t got = 0;
++    SemaphoreHandle_t lock = tts_stream_sb_lock();
+     (void)timeout_ms;
+ 
+     if (!data || size <= 0) {
+@@ -739,11 +759,17 @@ int cap_tts_stream_read(uint8_t *data, int size, uint32_t timeout_ms)
+     for (;;) {
+         size_t n;
+ 
++        if (!lock || xSemaphoreTake(lock, pdMS_TO_TICKS(TTS_STREAM_SB_LOCK_TO_MS)) != pdTRUE) {
++            break;
++        }
+         if (!s_ctx.sb || s_ctx.abort) {
++            xSemaphoreGive(lock);
+             break;
+         }
++        /* 持锁接收: 保证 end() 不会在本次接收期间释放 sb。锁在接收超时内必被归还。 */
+         n = xStreamBufferReceive(s_ctx.sb, data + got, (size_t)size - got,
+                                  pdMS_TO_TICKS(TTS_STREAM_POLL_MS));
++        xSemaphoreGive(lock);
+         if (n > 0) {
+             got += n;
+             if (got >= (size_t)size) {
+@@ -766,7 +792,7 @@ bool cap_tts_stream_active(void)
+ 
+ void cap_tts_stream_end(void)
+ {
+-    if (!s_ctx.session && !s_ctx.running && !s_ctx.sb && !s_ctx.lock && !s_ctx.item_sem) {
++    if (!s_ctx.session && !s_ctx.running && !s_ctx.lock && !s_ctx.item_sem) {
+         return;
+     }
+     s_ctx.abort = true;
+@@ -781,8 +807,16 @@ void cap_tts_stream_end(void)
+         s_ctx.running = false;
+     }
+     if (s_ctx.sb) {
+-        vStreamBufferDeleteWithCaps(s_ctx.sb);
+-        s_ctx.sb = NULL;
++        /* 与读取侧 (cap_tts_stream_read) 互斥: 等它退出正在进行的接收后再清空。
++         * 只清空、不释放: 缓冲常驻复用, 会话间靠 xStreamBufferReset 丢弃残留音频,
++         * 从而彻底消除 per-session 分配/释放 48KB PSRAM 带来的一切竞态。 */
++        SemaphoreHandle_t sb_lock = tts_stream_sb_lock();
++        if (sb_lock && xSemaphoreTake(sb_lock, pdMS_TO_TICKS(TTS_STREAM_SB_LOCK_TO_MS)) == pdTRUE) {
++            if (xStreamBufferReset(s_ctx.sb) != pdPASS) {
++                ESP_LOGW(TAG, "stream buffer reset deferred (reader still blocked)");
++            }
++            xSemaphoreGive(sb_lock);
++        }
+     }
+     if (s_ctx.lock) {
+         vSemaphoreDelete(s_ctx.lock);

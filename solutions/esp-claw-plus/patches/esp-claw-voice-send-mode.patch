@@ -1,0 +1,41 @@
+diff --git a/application/edge_agent/components/app_config/include/app_config.h b/application/edge_agent/components/app_config/include/app_config.h
+--- a/application/edge_agent/components/app_config/include/app_config.h
++++ b/application/edge_agent/components/app_config/include/app_config.h
+@@ -70,6 +70,7 @@
+     char voice_tts_speaker[64];
+     char voice_volume[8];
+     char voice_reply_mode[16];
++    char voice_send_mode[16];
+     char voice_tts_stream[8];
+     char lcd_brightness[8];
+ } app_config_t;
+diff --git a/application/edge_agent/components/app_config/app_config.c b/application/edge_agent/components/app_config/app_config.c
+--- a/application/edge_agent/components/app_config/app_config.c
++++ b/application/edge_agent/components/app_config/app_config.c
+@@ -77,6 +77,7 @@
+ #define APP_DEFAULT_VOICE_TTS_SPEAKER        ""
+ #define APP_DEFAULT_VOICE_VOLUME             "80"
+ #define APP_DEFAULT_VOICE_REPLY_MODE         "agent"
++#define APP_DEFAULT_VOICE_SEND_MODE          "auto"
+ #define APP_DEFAULT_VOICE_TTS_STREAM         "false"
+ #define APP_DEFAULT_LCD_BRIGHTNESS           "100"
+ 
+@@ -131,6 +132,7 @@
+     APP_CONFIG_FIELD(voice_tts_speaker, "voice_tts_spk", APP_DEFAULT_VOICE_TTS_SPEAKER),
+     APP_CONFIG_FIELD(voice_volume, "voice_volume", APP_DEFAULT_VOICE_VOLUME),
+     APP_CONFIG_FIELD(voice_reply_mode, "voice_reply_md", APP_DEFAULT_VOICE_REPLY_MODE),
++    APP_CONFIG_FIELD(voice_send_mode, "voice_send_md", APP_DEFAULT_VOICE_SEND_MODE),
+     APP_CONFIG_FIELD(voice_tts_stream, "voice_tts_strm", APP_DEFAULT_VOICE_TTS_STREAM),
+     APP_CONFIG_FIELD(lcd_brightness, "lcd_brightness", APP_DEFAULT_LCD_BRIGHTNESS),
+ };
+diff --git a/application/edge_agent/components/http_server/http_server_config_api.c b/application/edge_agent/components/http_server/http_server_config_api.c
+--- a/application/edge_agent/components/http_server/http_server_config_api.c
++++ b/application/edge_agent/components/http_server/http_server_config_api.c
+@@ -93,6 +93,7 @@
+     CONFIG_FIELD("voice",        voice_tts_resource_id),
+     CONFIG_FIELD("voice",        voice_tts_speaker),
+     CONFIG_FIELD("voice",        voice_reply_mode),
++    CONFIG_FIELD("voice",        voice_send_mode),
+     CONFIG_FIELD("voice",        voice_tts_stream),
+ };
+ 

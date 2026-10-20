@@ -27,6 +27,7 @@ HA_PATCH="$SOLUTION_DIR/patches/esp-claw-ha-config.patch"
 DISPLAY_PATCH="$SOLUTION_DIR/patches/esp-claw-display-owner.patch"
 SR_PATCH="$SOLUTION_DIR/patches/esp-claw-esp-sr.patch"
 VOICE_WAKE_PATCH="$SOLUTION_DIR/patches/esp-claw-voice-wake.patch"
+AUDIO_OWNER_PATCH="$SOLUTION_DIR/patches/esp-claw-audio-owner.patch"
 STACK_PATCH="$SOLUTION_DIR/patches/esp-claw-p4-task-stack-internal.patch"
 HA_VOICE_PATCH="$SOLUTION_DIR/patches/esp-claw-ha-voice-config.patch"
 PANEL_SETTINGS_PATCH="$SOLUTION_DIR/patches/esp-claw-panel-settings.patch"
@@ -40,6 +41,8 @@ DIRECT_REPLY_PATCH="$SOLUTION_DIR/patches/esp-claw-direct-reply.patch"
 TTS_STREAM_CONFIG_PATCH="$SOLUTION_DIR/patches/esp-claw-tts-stream-config.patch"
 HTTP_REUSE_PATCH="$SOLUTION_DIR/patches/esp-claw-http-reuse.patch"
 TTS_LOCAL_PATCH="$SOLUTION_DIR/patches/esp-claw-tts-local.patch"
+TTS_SB_STATIC_PATCH="$SOLUTION_DIR/patches/esp-claw-tts-stream-sb-static.patch"
+VOICE_SEND_MODE_PATCH="$SOLUTION_DIR/patches/esp-claw-voice-send-mode.patch"
 APP_OVERLAY="$SOLUTION_DIR/app/application/edge_agent/main"
 FS_OVERLAY="$SOLUTION_DIR/app/application/edge_agent/fatfs_image"
 UI_OVERLAY="$SOLUTION_DIR/app/application/edge_agent/components/http_server/frontend_source"
@@ -128,6 +131,18 @@ else
     echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
     exit 1
 fi
+
+echo "==> 音频设备所有权 (ADC/DAC 共用 codec: 录音撤销播放 + 排空, codec 引用计数, 48k 采集降采样)"
+if git -C "$SRC_DIR" apply --check "$AUDIO_OWNER_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$AUDIO_OWNER_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$AUDIO_OWNER_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+echo "    说明: ha_voice_arbiter 增 SPK 方向 (撤销 + 等待排空); lua_module_audio 增 codec 引用计数、"
+echo "          采集恒定 48k + C 侧降采样 (asr_rate/asr_channels); 播放侧轮询 spk_revoked 协作停机。"
 
 echo "==> 强制任务栈走内部 RAM (P4 flash/PSRAM 共享 MSPI, 避免 flash 事务 assert)"
 if git -C "$SRC_DIR" apply --check "$STACK_PATCH" 2>/dev/null; then
@@ -281,6 +296,32 @@ echo "    说明: cap_tts_stream 增本地模式 (mmap voice_data 分区 + esp_t
 echo "          lua audio.player 请求带 local=true 时走 raw://tts/stream.pcm; 语音设置页『TTS 引擎』可选本地/云。"
 echo "    注意: 分区表新增 voice_data 且 ota_0 扩至 5MB(去掉 ota_1), 首次构建需 idf.py reconfigure;"
 echo "          语音数据由 esptool_py_flash_to_partition 随 idf.py flash 一起烧录, 无需单独烧录。"
+
+echo "==> TTS 边收边播环形缓冲改静态常驻 (修复 e2e 收尾偶发 tlsf_free double free 崩溃)"
+if git -C "$SRC_DIR" apply --check "$TTS_SB_STATIC_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$TTS_SB_STATIC_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$TTS_SB_STATIC_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+echo "    说明: cap_tts_stream 环形缓冲由每次会话 heap 分配/释放 48KB PSRAM 改为启动期静态常驻"
+echo "          (EXT_RAM_BSS_ATTR 落 PSRAM bss + xStreamBufferCreateStatic), 会话间仅 xStreamBufferReset 清空;"
+echo "          读取/重置加静态互斥锁串行化。消除 player:close() 收尾时偶发的"
+echo "          tlsf_free 'block already marked as free' 崩溃 (该 48KB 块被堆上其他活动波及)。"
+
+echo "==> 语音发送模式开关 (voice_send_mode: auto 识别即发送 / manual 按 BOOT 确认)"
+if git -C "$SRC_DIR" apply --check "$VOICE_SEND_MODE_PATCH" 2>/dev/null; then
+    git -C "$SRC_DIR" apply "$VOICE_SEND_MODE_PATCH"
+elif git -C "$SRC_DIR" apply --reverse --check "$VOICE_SEND_MODE_PATCH" 2>/dev/null; then
+    echo "    补丁已应用, 跳过"
+else
+    echo "    错误: 补丁无法应用, 请确认 esp-claw 版本为 $ESP_CLAW_TAG" >&2
+    exit 1
+fi
+echo "    说明: app_config 增 voice_send_mode (NVS voice_send_md, 默认 auto) 并下发运行 JSON;"
+echo "          网页面板『语音助手』页可切换; manual 时识别完成后等 BOOT 轻点确认 (按住重录, 15s 超时作废)。"
 
 echo "==> 生成 board manager 配置"
 cd "$SRC_DIR/application/edge_agent"

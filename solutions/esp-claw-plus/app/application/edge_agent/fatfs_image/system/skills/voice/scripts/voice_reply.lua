@@ -8,21 +8,31 @@
 --             响应音频经 save_path 落盘; 端点为空则直接放弃本次回复。
 --   voice_tts_provider 非空: 加载 providers/tts_<provider>.lua 完成合成并落盘 (如 volcano 火山云,
 --             新版控制台 X-Api-Key 鉴权), 详见对应 provider 模块。
---   落盘后统一用 audio.player 异步播放; 播放期间轮询打断标志 /fatfs/voice_interrupt,
---             命中即 player:stop() (barge-in)。
+--   落盘/流式播报统一走播放 owner voice_playback; 播放期间轮询打断标志 /fatfs/voice_interrupt,
+--             命中即 pb:stop() (barge-in)。
 --   需先把 TTS 域名加入「HTTP 白名单」(search_http_allowlist)。
 
-local audio = require("audio")
-local bm = require("board_manager")
 local storage = require("storage")
 local delay = require("delay")
 local tts = require("voice_tts")
 local vc = require("voice_common")
+local playback = require("voice_playback")
+local round = require("voice_round")
 
 local TAG = "[voice_reply]"
 
 local text = (args and args.text) or ""
 print(TAG .. " agent reply (" .. tostring(#text) .. " chars): " .. text)
+
+-- 本轮轮次号 (闸门): voice_ptt 每次开始录音都递增它。记下进入时的号, 之后若用户又发起
+-- 新一轮录音, 本号即被视为过期 —— 本脚本据此在合成/播放前与播放中自行放弃, 不再插播过期
+-- 语音 (跨脚本归属见 voice_round / docs/adr/0004-voice-round-and-playback-owner.md)。
+local rid = round.id()
+
+-- 本轮是否已被新一轮录音取代 (闸门)。起播前与播放中都要查。
+local function superseded()
+    return not round.is_current(rid)
+end
 
 -- 状态反馈 (voice_status.txt -> 面板「状态:」行 + 串口日志), 屏幕桥/配置桥/打断信道
 -- 统一走 voice_common。状态是机器可读的 code (见 SKILL.md「状态码」), detail 只承载补充文本。
@@ -53,57 +63,53 @@ if USE_GENERIC_TTS and TTS_URL == "" then
     return
 end
 
--- 打开 DAC 输出 (仅真实 TTS 音频走这里)。
-local codec, rate, channels, bits = bm.get_audio_codec_output_params("audio_dac")
-if not codec then
-    print(TAG .. " get_audio_codec_output_params(audio_dac) failed, skip playback")
-    set_error("扬声器不可用")
-    return
-end
-
-local output = audio.new_output({ codec, rate, channels, bits, volume = tonumber(cfg.voice_volume) or 80 })
-if not output then
-    print(TAG .. " open audio output failed, skip playback")
-    set_error("扬声器占用")
+-- 播放 owner (voice_playback): 统一开 DAC 输出、建 player、流式/落盘播报与收尾。
+-- player 惰性创建, 故「扬声器不可用/占用」在此返回, 「播放器创建失败」在首次播放时返回。
+local pb, pb_reason = playback.open(cfg)
+if not pb then
+    print(TAG .. " open audio output failed, skip playback: " .. tostring(pb_reason))
+    set_error(pb_reason or "扬声器不可用")
     return
 end
 
 -- 播放前清掉可能残留的打断标志, 避免上一条过早停止本次播放。
 vc.clear_interrupt()
 
-local player = audio.player({ output = output })
-if not player then
-    print(TAG .. " create player failed, skip playback")
-    set_error("播放器创建失败")
-    output:close()
-    return
-end
-
 if tts.is_local(cfg) then
     -- 本地引擎 (esp-tts): 无落盘中间产物, 直接流式合成播放。
     -- 单段文本: 建会话后立即声明不再追加, 队列排空即自然收尾 (EOF)。
-    if not player:play_stream(tts.stream_request(cfg, text)) then
-        print(TAG .. " play_stream failed")
-        set_error("播放失败")
-        player:close()
-        output:close()
+    if superseded() then
+        print(TAG .. " round #" .. tostring(rid) .. " superseded before playback -> skip")
+        pb:close()
         return
     end
-    player:play_stream_finish()
+    local ok_stream, serr = pb:play_stream(tts.stream_request(cfg, text))
+    if not ok_stream then
+        print(TAG .. " play_stream failed: " .. tostring(serr))
+        set_error(serr or "播放失败")
+        pb:close()
+        return
+    end
+    pb:play_stream_finish()
 else
     -- 合成: 统一走共享模块 voice_tts (generic 端点或 provider 分派)。
     local save_path, tts_error = tts.synthesize(cfg, text, "voice_reply", storage.get_root_dir())
     if not save_path then
         set_error(tts_error or "语音合成失败")
-        player:close()
-        output:close()
+        pb:close()
         return
     end
-    if not player:play(save_path) then
-        print(TAG .. " play failed: " .. save_path)
-        set_error("播放失败")
-        player:close()
-        output:close()
+    -- 合成是网络调用, 可能耗时数秒; 期间用户若已发起新一轮录音, 本轮过期 -> 不起播。
+    if superseded() then
+        print(TAG .. " round #" .. tostring(rid) .. " superseded during synthesis -> skip")
+        pb:close()
+        return
+    end
+    local ok_play, perr = pb:play_file(save_path)
+    if not ok_play then
+        print(TAG .. " play failed: " .. save_path .. " (" .. tostring(perr) .. ")")
+        set_error(perr or "播放失败")
+        pb:close()
         return
     end
     print(TAG .. " playback started: " .. save_path)
@@ -111,16 +117,12 @@ end
 
 set_status("speaking")
 
--- 轮询到播放结束; 期间若用户开始说话 (barge-in) 立即停止。
+-- 轮询到播放结束; 期间若用户开始说话 (barge-in) 或本轮已被新一轮取代, 立即停止。
 local interrupted = false
-while true do
-    local st = player:poll()
-    if not (st and st.running) then
-        break
-    end
-    if vc.interrupt_requested() then
-        print(TAG .. " barge-in detected -> stop playback")
-        player:stop()
+while pb:poll() do
+    if not round.is_current(rid) or vc.interrupt_requested() then
+        print(TAG .. " barge-in / superseded -> stop playback")
+        pb:stop()
         vc.clear_interrupt()
         interrupted = true
         break
@@ -128,8 +130,7 @@ while true do
     delay.delay_ms(20)
 end
 
-player:close()
-output:close()
+pb:close()
 -- 被打断时不写状态: 此时 voice_ptt.lua 已开始录音并写了 recording, 别把它覆盖掉。
 if not interrupted then
     set_status("idle")

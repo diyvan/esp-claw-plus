@@ -49,6 +49,8 @@ BOOT 键按下 → 录音(WAV) → [ASR] → 文本注入渠道层 → Agent Loo
 | `.../system/skills/voice/scripts/voice_ptt.lua` | `/system` | 常驻 PTT 循环：GPIO35 按下 → 录音 → ASR → `ep.publish_message` 注入 `voice/voice`（ASR 端点/密钥 + `voice_enabled`/`voice_wake_enabled` 门控读运行时 JSON） |
 | `.../system/skills/voice/scripts/voice_reply.lua` | `/system` | 回复播报（非流式回退路径）：`args.text` → [TTS]（端点为空则放弃播报，不播提示音；TTS 端点/密钥读运行时 JSON） |
 | `.../system/skills/voice/scripts/voice_tts.lua` | `/system` | TTS **共享合成模块**：`synthesize(cfg, text, out_base, root_dir)`（落盘回退路径）+ `stream_request(cfg, text)`（返回流式请求描述，供边收边播，见 §7.3），被 `voice_reply.lua` 与 `voice_ptt.lua` 的句子级流水线复用（generic 端点或 provider 分派，见 §7） |
+| `.../system/skills/voice/scripts/voice_playback.lua` | `/system` | **播放 owner（共享模块）**：`open(cfg)` 取板级 DAC 参数并开输出（player 惰性建），提供 `play_stream` / `play_stream_append` / `play_stream_finish` / `play_file` / `poll` / `stop` / `close`；`voice_ptt.lua`（逐句流水线）与 `voice_reply.lua`（整段回退）都经它播放（见 `docs/adr/0004`） |
+| `.../system/skills/voice/scripts/voice_round.lua` | `/system` | **轮次闸门（共享模块）**：`begin()` 递增并落盘 `/fatfs/voice_round`；`id()` / `is_current(rid)` 供异步回复脚本判断自己是否已被新一轮录音取代（见 `docs/adr/0004`） |
 | `.../system/skills/voice/scripts/voice_selftest.lua` | `/system` | 录音+回放自检（不依赖按键），验证 ES8311 输入/输出通路 |
 | `.../system/skills/voice/scripts/providers/*.lua` | `/system` | 云端服务适配层（供应商插件）：`util.lua` 公共工具 + `asr_volcano.lua` / `tts_volcano.lua` 火山引擎适配器，见 §6.3 |
 | `.../system/font/font_puhui_common_14_1.bin` | `/system` | 全量常用字 CJK 字体（272KB），供面板显示中文 |
@@ -61,12 +63,14 @@ BOOT 键按下 → 录音(WAV) → [ASR] → 文本注入渠道层 → Agent Loo
 | `patches/esp-claw-tts-stream.patch` | esp-claw 补丁 | 延迟优化②：新增 `cap_tts_stream` 组件（HTTP 流式 + base64 增量解码 + StreamBuffer）并为 `audio.player` 增 `play_stream`（`raw://` 输入回调拉取），见 §7.3 |
 | `patches/esp-claw-direct-reply.patch` | esp-claw 补丁 | 语音回复模式开关（agent / direct）：C 核新增 `DIRECT_REPLY` flag + direct 极简 prompt 短路、`app_config` 增 `voice_reply_mode`、router 对 `chat_id=voice_llm` 打 flag，见 §8 |
 | `patches/esp-claw-tts-stream-config.patch` | esp-claw 补丁 | 把边收边播开关从 `/fatfs/voice_tts_stream` 标记文件提升为运行时配置：`app_config` 增 `voice_tts_stream`（默认 `false`，NVS key `voice_tts_strm`）、`http_server_config_api.c` 注册字段并做布尔校验，见 §7.3 |
+| `patches/esp-claw-audio-owner.patch` | esp-claw 补丁 | 音频设备所有权：`ha_voice_arbiter` 增 `SPK` 方向（撤销 + 排空）、`lua_module_audio` 增 codec 引用计数与 48k 采集 + C 侧降采样（`asr_rate` / `asr_channels`）、播放侧轮询 `spk_revoked` 协作停机，见 §9 |
+| `patches/esp-claw-voice-send-mode.patch` | esp-claw 补丁 | 语音发送模式开关（`auto` / `manual`）：`app_config` 增 `voice_send_mode`（默认 `auto`，NVS key `voice_send_md`）、`http_server_config_api.c` 注册字段，见 §10 |
 
 > **运行时配置桥**：`/fatfs/ha_voice_runtime.json` 由 C 侧（`ha_panel.c`）写出，字段 `ha_enabled` /
 > `voice_enabled` / `ha_base_url` / `ha_token` / `voice_wake_enabled` / `voice_asr_provider` /
 > `voice_asr_url` / `voice_asr_api_key` / `voice_asr_resource_id` / `voice_tts_provider` /
 > `voice_tts_url` / `voice_tts_api_key` / `voice_tts_resource_id` / `voice_tts_speaker` /
-> `voice_reply_mode` / `voice_tts_stream`；Lua 侧用
+> `voice_reply_mode` / `voice_send_mode` / `voice_tts_stream`；Lua 侧用
 > `storage.read_file` + `json.decode` 读取（`voice_ptt.lua` 带 1s 缓存，`voice_reply.lua` 单次读取）。
 >
 > `voice_asr_provider` / `voice_tts_provider` 为**供应商选择**：空 / `generic` 走原通用契约，
@@ -263,11 +267,16 @@ $IDF_PYTHON_ENV_PATH/bin/python solutions/ha_ai_panel/scripts/install_voice_rule
 - ⚠️ **必须先把 ASR/TTS 域名加入 `cap_http_request` 主机白名单**（NVS `http_allow_ls` /
   `search_http_allowlist`），否则请求会被拒绝；密钥非空时自动附 `Authorization: Bearer <key>`。
 
-**语音打断（barge-in，M4 已实现）**
+**语音打断（barge-in，M4 已实现；轮次闸门见 `docs/adr/0004`）**
 
-- 音频**没有全局仲裁器**（`ha_voice_arbiter` 只管麦克风输入），跨脚本停止播放只能靠文件标志：
-  用户按下 BOOT 或唤醒命中时 `voice_ptt.lua` 写 `/fatfs/voice_interrupt`；`voice_reply.lua`
-  播放中每 20ms `player:poll()` 一次并检查该标志，命中即 `player:stop()` 并清除标志。
+- 设备级所有权已下沉到 C 层 `ha_voice_arbiter`（MIC 独占 + SPK 多 writer 共存，采集请求会撤销
+  并排空 SPK writer，见 `docs/adr/0003`）。Lua 侧的跨脚本协调有两条互补信道：
+  - **轮次闸门**：用户开始说话时 `voice_ptt.lua` 调 `round.begin()` 递增 `/fatfs/voice_round`；
+    `voice_reply.lua` 记下进入时的轮次号，起播前与播放中用 `round.is_current()` 判断本轮是否已被
+    取代，过期即不起播 / 停播（语义归属，不依赖标志是否被及时清掉）。
+  - **打断标志**：用户按下 BOOT 或唤醒命中时 `voice_ptt.lua` 写 `/fatfs/voice_interrupt`；
+    `voice_reply.lua` 播放中每 20ms `pb:poll()` 一次并检查该标志，命中即 `pb:stop()` 并清除标志
+    （立即停音的边沿信号）。
 
 **HA 执行（M2 已实现，见 `ha_control` / `local_scene` 技能）**
 
@@ -433,18 +442,20 @@ $IDF_PYTHON_ENV_PATH/bin/python solutions/ha_ai_panel/scripts/install_voice_rule
 > 用**文件**（而非新增 Lua↔C 绑定或事件）做流桥，是为了复用既有机制、零新增绑定：C 侧天然串行，
 > 避免路由 async 并发拉起多路播放。
 
-**Lua 侧（overlay，`voice_ptt.lua` + 共享模块 `voice_stream.lua` / `voice_tts.lua`）**
+**Lua 侧（overlay，`voice_ptt.lua` + 共享模块 `voice_stream.lua` / `voice_tts.lua` / `voice_playback.lua`）**
 
 > 文件桥**读端**（整读 + 差分 + 剥哨兵 + 按标点切句）已收敛为深模块 `voice_stream.lua`（唯一
 > owner）；`voice_ptt.lua` 与自测 `voice_e2e.lua` 只 `require("voice_stream")` 取 consumer，
 > 不再各留一份逐字拷贝。C↔Lua 两侧的权威契约见 **§7.6**。
+> **播放**（开 DAC / 惰性建 player / 流式+落盘 / poll+stop+close）已收敛为 `voice_playback.lua`
+> （唯一 owner，见 `docs/adr/0004`）：`voice_ptt.lua` 与 `voice_reply.lua` 都经它播放。
 
 - `voice_ptt.lua` 状态机新增 `waiting` 态：注入 ASR 文本进 Agent 后即进入等待，**每 20ms**
   （`WAIT_POLL_MS`）从 consumer `:next()` 取句，逐句经 `voice_tts.synthesize()` 合成并用
-  `audio.player` 播放（player 惰性创建，一句播完再播下一句）→ 天然串行、无需并发仲裁。
+  `voice_playback` 播放（player 惰性创建，一句播完再播下一句）→ 天然串行、无需并发仲裁。
 - 结束条件：读到结束标记 **且** 队列清空 **且** player 空闲 → 写回「空闲」，回到 `idle` 态。
 - barge-in：`start_recording()` 与 `wait_step()` 轮询里检查 `/fatfs/voice_interrupt`，命中即
-  `player:stop()` 并中止等待（复用 §6 的打断标志）。
+  停播并中止等待（复用 §6 的打断标志）；轮次闸门 `voice_round` 提供语义归属判定（见 `docs/adr/0004`）。
 - 超时：沿用 `REPLY_TIMEOUT_MS`（30s），无任何 delta 则状态行显示 `AI 无响应`。
 - `voice_reply.lua` 重构为复用共享模块 `voice_tts.lua`（generic 端点或 provider 分派），
   作为**非流式回退路径**保留（LLM 后端不支持流式时仍可用）。
@@ -830,4 +841,89 @@ router 据此打 flag（`voice` / `voice_llm` 均置 `STREAM_REPLY`，`voice_llm
 **验证口径**：真机分别置于 `agent` / `direct` 各跑一轮同类提问，串口应见 router 日志
 `timing: router_submit ... chat_id=voice_llm stream=1 direct=1` 与 coreside
 `direct_reply request=... context=0 tools=0`，对比首字延迟（`llm_http_start` → 首句播放）。
+
+---
+
+## 9. 音频设备所有权（ADC/DAC 共用 codec，本轮实现）
+
+**动因**：板载麦克风与扬声器是**同一颗 ES8311、同一个 I2S port 0**（`board_devices.yaml` 里
+`audio_adc` / `audio_dac` 只是两个 handle）。播放中再次发起录音会导致**设备重启**，静态推断有三层
+根因：
+
+1. 录音以 16kHz 打开 codec，就地把与 DAC 共享的 I2S 时钟从 48kHz 改成 16kHz，播放侧仍在写；
+2. 跨 owner use-after-close：多个 `audio.new_output` 复用同一 `codec_dev` 句柄，一方 `close()`
+   会把该句柄 `esp_codec_dev_close` 置 NULL，另一方仍在写；
+3. `wait_step()` 内 player 重建/关闭竞态。
+
+修复不新增模块，而是把既有的 `ha_voice_arbiter`（原本只做麦克风仲裁）升格为**设备级 owner**，
+覆盖 `MIC` + `SPK` 两个方向（见 [CONTEXT.md](file:///Users/diyvan/Lab/esp-idf/ESP32-P4-WIFI6-Touch-LCD-3.5/solutions/esp-claw-plus/CONTEXT.md) 的「音频设备所有权」）；
+决策见 [docs/adr/0003-audio-device-owner.md](file:///Users/diyvan/Lab/esp-idf/ESP32-P4-WIFI6-Touch-LCD-3.5/solutions/esp-claw-plus/docs/adr/0003-audio-device-owner.md)。
+
+**补丁 `patches/esp-claw-audio-owner.patch`（C 侧上游组件）**
+
+- `ha_voice_arbiter.[ch]`：新增 `SPK` 方向 API——`ha_voice_arbiter_spk_acquire(timeout_ms)` /
+  `_spk_release()` / `_spk_revoked()`，设备级 `refcount` 由 `portMUX` 保护（允许多 writer 共存）。
+  `ha_voice_arbiter_acquire()`（MIC）拿到信号量后置 `revoked = true` 并**循环等 SPK 计数归零**
+  （上限 `HA_VOICE_SPK_DRAIN_TIMEOUT_MS` = 500ms，超时打警告后继续），避免采集方与播放方抢时钟。
+  另把 AFE 前端的立体声下混 + 抽取函数泛化为共享 helper
+  `ha_voice_pcm_downmix_decimate(in, out_samples, in_channels, factor, out)`（`ha_voice_wake.c`
+  与 Lua 录音路径共用）。
+- `lua_module_audio`：
+  - **codec 引用计数**（`audio_codec_ref_add/remove`，按 `esp_codec_dev_handle_t` 计）：只有首个
+    引用才 `esp_codec_dev_open`、末个引用才 `esp_codec_dev_close`，消除跨 owner 关句柄；
+  - **SPK 接入**：`audio_device_open`（OUTPUT）先 `ha_voice_arbiter_spk_acquire(200)`，被撤销则拒绝
+    open（日志 `Output open rejected: speaker revoked for capture`）；close/GC 时 `spk_release`。
+    INPUT 仍走 `ha_voice_arbiter_acquire(3000)`；
+  - **48k 采集不变量**：INPUT 恒以板级默认格式（48kHz/2ch）打开，新增可选参数
+    `asr_rate` / `asr_channels` 由 `audio_device_configure_downsample()` 解析；`input:read()` 读到
+    codec 帧后调用共享 helper 降采样，`info()` 报告**降采样后**的格式（`out_fmt`）。
+- `audio_player.c`：`audio_player_out_cb` 在原有守卫后检查 `ha_voice_arbiter_spk_revoked()`，命中
+  即返回 0（**协作式撤销**），让 `esp_audio_simple_player` 自然停机，Lua 侧 `poll()` 收尾并释放输出。
+
+**overlay 改动（无补丁）**：`voice_ptt.lua` 的 `start_recording()` 不再请求 16kHz，改为
+`audio.new_input({ ..., rate, channels, bits, asr_rate = 16000, asr_channels = 1 })`；
+`ha_voice_wake.c` 改用共享下混 helper。
+
+**验证口径**：真机在 TTS 播放中按下 BOOT，串口应见 `speaker drain` / `Player aborted: speaker
+revoked for capture` 而非重启；录音 `info()` 报 16000Hz/1ch，`voice_ptt` 日志的 `bytes=` 约为原先
+48k 立体声的 1/6。
+
+---
+
+## 10. 语音发送模式开关（auto / manual，本轮实现）
+
+**动因**：提高语音识别的确定性——有时识别结果不准确或用户改主意，希望**看过识别结果再决定是否发送**；
+同时保留现有的「识别即发送」体验。决策与手势见
+[docs/adr/0002-voice-send-mode.md](file:///Users/diyvan/Lab/esp-idf/ESP32-P4-WIFI6-Touch-LCD-3.5/solutions/esp-claw-plus/docs/adr/0002-voice-send-mode.md)。
+
+**两种模式**（与回复模式 `voice_reply_mode` **正交**，可任意组合）
+
+| 模式 | 行为 | 适用 |
+|---|---|---|
+| `auto`（默认） | 识别出文本后立即注入 Agent（原行为，零回归） | 免提 / 快节奏 |
+| `manual` | 识别出文本后**不发送**，转 `pending` 态写状态码 `confirming`，等 BOOT 键确认 | 需要检查识别结果 |
+
+**手势**（pending 态下，复用现有 BOOT 键，**零新 UI**）
+
+| 手势 | 行为 |
+|---|---|
+| 轻点（按住未达 `MANUAL_HOLD_MIN_MS` = 500ms 即松开） | 发送本次结果（与 `auto` 同一套注入 + 播报） |
+| 按住（≥ 500ms） | 作废本次结果并**立即重录**（松手后照常收尾 → 再次进入 `pending`） |
+| 无操作 15s（`PENDING_TIMEOUT_MS`） | 自动作废回 `idle`，**不自动发送** |
+
+**开关位置**：NVS `voice_send_mode`（结构体成员 / JSON 键同名；NVS key 受 15 字符上限约束，实际
+落盘键为 `voice_send_md`）。网页「语音助手」页 `voice_send_mode` 下拉 + `app_config` 默认值
+`auto`；**切换下一轮语音生效**。
+
+**C 侧改动（`patches/esp-claw-voice-send-mode.patch`）**：`app_config.[ch]` 新增 `voice_send_mode`
+（默认 `auto`）、`http_server_config_api.c` 注册到 `voice` 组。
+
+**overlay 改动（无补丁）**：`voice_ptt.lua`（`pending` 态 + `handoff_recognized()` / `send_pending()`
+/ `discard_pending()` / `pending_step()`、`on_press_down` / `on_press_up` 的 pending 分支）、
+`ha_panel.c`（状态码表增 `confirming` → 「待确认」+ 镜像运行时 JSON）、网页面板
+（`voice_send_mode` 下拉 + i18n + 重建 `dist`）。
+
+**验证口径**：置 `manual`，说一句 → 面板显示「待确认」；轻点 BOOT → 串口见
+`manual: confirmed, sending -> ...` 并开始播报；按住 BOOT ≥ 500ms → 见 `manual: held -> discard and
+re-record` 并立即重录；不作任何操作 15s → 见 `manual: pending discarded (timeout)` 且回 `idle`。
 

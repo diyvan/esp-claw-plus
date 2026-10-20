@@ -58,6 +58,17 @@ void ha_panel_settings_poll(void);
 bool ha_panel_settings_commit_pending(void);
 
 /**
+ * @brief Turn the LCD backlight on (restore the current brightness) or off,
+ *        for the standby toggle.
+ *
+ * Only touches the LEDC duty; the persisted brightness and the "亮度" slider
+ * value are left untouched, so waking restores the level the user had set.
+ * Safe to call without the LVGL lock (plain LEDC write, like the restore in
+ * ha_panel_settings_attach()).
+ */
+void ha_panel_settings_set_backlight_enabled(bool enabled);
+
+/**
  * @brief Run deferred, blocking network work requested from the "网络" sub-menu
  *        (Wi-Fi scan / STA apply + NVS save).
  *

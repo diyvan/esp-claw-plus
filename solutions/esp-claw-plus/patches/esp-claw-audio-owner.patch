@@ -1,0 +1,612 @@
+diff --git a/components/common/ha_voice_arbiter/include/ha_voice_arbiter.h b/components/common/ha_voice_arbiter/include/ha_voice_arbiter.h
+--- a/components/common/ha_voice_arbiter/include/ha_voice_arbiter.h
++++ b/components/common/ha_voice_arbiter/include/ha_voice_arbiter.h
+@@ -15,10 +15,11 @@
+ #endif
+ 
+ /*
+- * Microphone arbiter.
++ * Audio device arbiter: microphone plus loudspeaker.
+  *
+- * The board exposes a single I2S RX path (one physical microphone). Two
+- * independent consumers need it at different times:
++ * The board exposes a single ADC/DAC pair behind one physical codec and, on
++ * this design, both directions share I2S port 0. Two independent consumers
++ * need the microphone at different times:
+  *
+  *   - "listener": the always-on WakeNet front-end (ha_voice_wake.c), which
+  *     keeps the codec open at 48 kHz / 2 ch and runs the AFE in the back.
+@@ -34,6 +35,19 @@
+  *     capture session finishes (handoff), so the very first words are not
+  *     swallowed by the front-end.
+  *
++ * The loudspeaker (DAC) direction is owned separately, with a different
++ * rule set, because playback and capture cannot run at the same time on a
++ * shared codec/sample-clock:
++ *
++ *   - Several writers may hold the speaker at once (voice_ptt owns the
++ *     per-sentence pipeline, voice_reply owns the fallback path); the holder
++ *     count is what matters, not who they are.
++ *   - A capture request revokes the speaker: writers poll
++ *     ha_voice_arbiter_spk_revoked() and abort, then drop their output device,
++ *     and the capture side waits for the holder count to reach zero before it
++ *     touches the codec. This is how "start recording during playback" stops
++ *     the previous reply instead of fighting it for the sample clock.
++ *
+  * If the arbiter was never initialised all APIs degrade to "no arbitration":
+  * acquire succeeds and yield is never requested, preserving legacy behaviour.
+  */
+@@ -96,6 +110,50 @@
+  */
+ void ha_voice_arbiter_hold_for_capture(void);
+ 
++/**
++ * @brief Speaker side: register a writer (a playback pipeline).
++ *
++ * Several writers may hold the speaker at once; the arbiter only counts them.
++ * Always pair with ha_voice_arbiter_spk_release(). Returns false if the
++ * speaker has already been revoked in favour of a capture session — the caller
++ * must not start playback in that case.
++ *
++ * @param timeout_ms Maximum time to wait for a pending revocation to clear.
++ * @return true if the caller may play, false otherwise.
++ */
++bool ha_voice_arbiter_spk_acquire(uint32_t timeout_ms);
++
++/**
++ * @brief Speaker side: unregister a writer previously accepted by
++ *        ha_voice_arbiter_spk_acquire().
++ */
++void ha_voice_arbiter_spk_release(void);
++
++/**
++ * @brief Speaker side: whether the speaker has been revoked for capture.
++ *
++ * A writer polls this from its write path and aborts when it returns true, so
++ * the capture side can reclaim the shared codec.
++ */
++bool ha_voice_arbiter_spk_revoked(void);
++
++/**
++ * @brief Downmix interleaved 16-bit PCM to a single channel and decimate it by
++ *        an integer factor.
++ *
++ * Shared by the two consumers that take the microphone at 48 kHz but need
++ * 16 kHz mono: the always-on WakeNet front-end (ha_voice_wake.c) and the Lua
++ * recording path (lua_module_audio). It lives here because this component is
++ * the audio-device module both of them already depend on.
++ *
++ * @param in           Interleaved input samples.
++ * @param out_samples  Number of output samples to produce.
++ * @param in_channels  Input channels per frame (1 or 2).
++ * @param factor       Input samples per output sample (>= 1).
++ * @param out          Output buffer with @p out_samples entries.
++ */
++void ha_voice_pcm_downmix_decimate(const int16_t *in, int out_samples, int in_channels, int factor, int16_t *out);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/components/common/ha_voice_arbiter/ha_voice_arbiter.c b/components/common/ha_voice_arbiter/ha_voice_arbiter.c
+--- a/components/common/ha_voice_arbiter/ha_voice_arbiter.c
++++ b/components/common/ha_voice_arbiter/ha_voice_arbiter.c
+@@ -14,17 +14,47 @@
+ 
+ static const char *TAG = "ha_voice_arb";
+ 
++/* Upper bound on how long a capture request waits for speaker writers to let
++ * go of the shared codec before it reconfigures the sample clock anyway. */
++#define HA_VOICE_SPK_DRAIN_TIMEOUT_MS 500
++#define HA_VOICE_SPK_DRAIN_POLL_MS    5
++
+ /* Binary semaphore: given == microphone is free. */
+ static SemaphoreHandle_t s_mic_sem;
+ /* Advisory flags, only meaningful once the arbiter is initialised. */
+ static volatile bool s_capture_active;
+ static volatile bool s_handoff;
+ 
++/* Speaker side: a plain writer count plus a revocation flag. Several writers
++ * may hold the speaker; when a capture request arrives the flag is raised and
++ * the capture side waits for the count to reach zero. */
++static portMUX_TYPE s_spk_lock = portMUX_INITIALIZER_UNLOCKED;
++static int s_spk_count;
++static volatile bool s_spk_revoked;
++
+ static bool ha_voice_arbiter_ready(void)
+ {
+     return s_mic_sem != NULL;
+ }
+ 
++static int ha_voice_arbiter_spk_count_get(void)
++{
++    portENTER_CRITICAL(&s_spk_lock);
++    int count = s_spk_count;
++    portEXIT_CRITICAL(&s_spk_lock);
++    return count;
++}
++
++static void ha_voice_arbiter_spk_count_add(int delta)
++{
++    portENTER_CRITICAL(&s_spk_lock);
++    s_spk_count += delta;
++    if (s_spk_count < 0) {
++        s_spk_count = 0;
++    }
++    portEXIT_CRITICAL(&s_spk_lock);
++}
++
+ esp_err_t ha_voice_arbiter_init(void)
+ {
+     if (s_mic_sem != NULL) {
+@@ -40,6 +70,8 @@
+ 
+     s_capture_active = false;
+     s_handoff = false;
++    s_spk_revoked = false;
++    ha_voice_arbiter_spk_count_add(-ha_voice_arbiter_spk_count_get());
+     s_mic_sem = sem;
+ 
+     ESP_LOGI(TAG, "microphone arbiter ready");
+@@ -54,14 +86,27 @@
+ 
+     s_capture_active = true;
+ 
+-    if (xSemaphoreTake(s_mic_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+-        ESP_LOGD(TAG, "capture acquired microphone");
+-        return true;
++    if (xSemaphoreTake(s_mic_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
++        s_capture_active = false;
++        ESP_LOGW(TAG, "capture acquire timed out after %u ms", (unsigned)timeout_ms);
++        return false;
+     }
+ 
+-    s_capture_active = false;
+-    ESP_LOGW(TAG, "capture acquire timed out after %u ms", (unsigned)timeout_ms);
+-    return false;
++    /* Ask every speaker writer to abort, then let the shared codec fall silent
++     * before the caller reconfigures it for capture. */
++    s_spk_revoked = true;
++    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(HA_VOICE_SPK_DRAIN_TIMEOUT_MS);
++    while (ha_voice_arbiter_spk_count_get() > 0) {
++        if (xTaskGetTickCount() >= deadline) {
++            ESP_LOGW(TAG, "speaker drain timed out with %d writer(s)",
++                     ha_voice_arbiter_spk_count_get());
++            break;
++        }
++        vTaskDelay(pdMS_TO_TICKS(HA_VOICE_SPK_DRAIN_POLL_MS));
++    }
++
++    ESP_LOGD(TAG, "capture acquired microphone");
++    return true;
+ }
+ 
+ void ha_voice_arbiter_release(void)
+@@ -72,10 +117,44 @@
+ 
+     s_capture_active = false;
+     s_handoff = false;
++    s_spk_revoked = false;
+     xSemaphoreGive(s_mic_sem);
+     ESP_LOGD(TAG, "capture released microphone");
+ }
+ 
++bool ha_voice_arbiter_spk_acquire(uint32_t timeout_ms)
++{
++    if (!ha_voice_arbiter_ready()) {
++        return true; /* degrade to no arbitration */
++    }
++
++    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
++    while (s_spk_revoked) {
++        if (xTaskGetTickCount() >= deadline) {
++            ESP_LOGD(TAG, "speaker acquire refused: revoked for capture");
++            return false;
++        }
++        vTaskDelay(pdMS_TO_TICKS(HA_VOICE_SPK_DRAIN_POLL_MS));
++    }
++
++    ha_voice_arbiter_spk_count_add(1);
++    return true;
++}
++
++void ha_voice_arbiter_spk_release(void)
++{
++    if (!ha_voice_arbiter_ready()) {
++        return;
++    }
++
++    ha_voice_arbiter_spk_count_add(-1);
++}
++
++bool ha_voice_arbiter_spk_revoked(void)
++{
++    return s_spk_revoked;
++}
++
+ bool ha_voice_arbiter_afe_acquire(uint32_t timeout_ms)
+ {
+     if (!ha_voice_arbiter_ready()) {
+@@ -124,3 +203,22 @@
+ {
+     s_handoff = true;
+ }
++
++void ha_voice_pcm_downmix_decimate(const int16_t *in, int out_samples, int in_channels, int factor, int16_t *out)
++{
++    if (!in || !out || in_channels < 1 || factor < 1) {
++        return;
++    }
++    for (int i = 0; i < out_samples; i++) {
++        int32_t acc = 0;
++        for (int k = 0; k < factor; k++) {
++            const int16_t *frame = &in[(i * factor + k) * in_channels];
++            int32_t frame_sum = 0;
++            for (int ch = 0; ch < in_channels; ch++) {
++                frame_sum += frame[ch];
++            }
++            acc += frame_sum / in_channels;
++        }
++        out[i] = (int16_t)(acc / factor);
++    }
++}
+diff --git a/components/lua_modules/lua_module_audio/src/audio_private.h b/components/lua_modules/lua_module_audio/src/audio_private.h
+--- a/components/lua_modules/lua_module_audio/src/audio_private.h
++++ b/components/lua_modules/lua_module_audio/src/audio_private.h
+@@ -77,6 +77,10 @@
+     audio_device_kind_t kind;
+     esp_codec_dev_handle_t codec_dev;
+     audio_format_t fmt;
++    /* Format exposed to Lua. Equal to fmt except for inputs opened at the board
++     * codec format but delivered downsampled to the requested ASR dimensions. */
++    audio_format_t out_fmt;
++    uint8_t decim_factor;   /* codec frames per delivered sample; 0 = no conversion */
+     int volume;
+     bool closed;
+     uint8_t holders;
+diff --git a/components/lua_modules/lua_module_audio/src/audio_device.c b/components/lua_modules/lua_module_audio/src/audio_device.c
+--- a/components/lua_modules/lua_module_audio/src/audio_device.c
++++ b/components/lua_modules/lua_module_audio/src/audio_device.c
+@@ -12,6 +12,73 @@
+  * listener to yield; this is the only cross-module mic mutual exclusion. */
+ #define AUDIO_INPUT_ARBITER_TIMEOUT_MS 3000
+ 
++/* Opening an output device asks the arbiter whether the speaker is free. It
++ * fails fast when a capture session is taking the shared codec, rather than
++ * letting two sample clocks fight over it. */
++#define AUDIO_OUTPUT_ARBITER_TIMEOUT_MS 200
++
++/* Every Lua device object of one kind wraps the same board codec handle (all
++ * outputs share audio_dac, all inputs share audio_adc), and both handles sit
++ * behind one chip on one I2S port. The handle must therefore be reference
++ * counted: the codec is opened by the first device and closed by the last.
++ * Closing on the first close would pull the codec out from under a sibling
++ * still streaming - the reboot seen when a recording tears down a concurrent
++ * playback. */
++#define AUDIO_CODEC_SLOTS 4
++static struct {
++    esp_codec_dev_handle_t handle;
++    int refs;
++} s_codec_slots[AUDIO_CODEC_SLOTS];
++static portMUX_TYPE s_codec_lock = portMUX_INITIALIZER_UNLOCKED;
++
++/* Returns true when this is the first reference, i.e. the codec must be opened. */
++static bool audio_codec_ref_add(esp_codec_dev_handle_t handle)
++{
++    bool first = false;
++    int free_slot = -1;
++
++    portENTER_CRITICAL(&s_codec_lock);
++    for (int i = 0; i < AUDIO_CODEC_SLOTS; i++) {
++        if (s_codec_slots[i].refs > 0 && s_codec_slots[i].handle == handle) {
++            s_codec_slots[i].refs++;
++            portEXIT_CRITICAL(&s_codec_lock);
++            return false;
++        }
++        if (free_slot < 0 && s_codec_slots[i].refs == 0) {
++            free_slot = i;
++        }
++    }
++    if (free_slot >= 0) {
++        s_codec_slots[free_slot].handle = handle;
++        s_codec_slots[free_slot].refs = 1;
++        first = true;
++    } else {
++        ESP_LOGW(TAG, "Codec ref table full, opening handle unconditionally");
++        first = true;
++    }
++    portEXIT_CRITICAL(&s_codec_lock);
++    return first;
++}
++
++/* Returns true when this was the last reference, i.e. the codec must be closed. */
++static bool audio_codec_ref_remove(esp_codec_dev_handle_t handle)
++{
++    bool last = false;
++
++    portENTER_CRITICAL(&s_codec_lock);
++    for (int i = 0; i < AUDIO_CODEC_SLOTS; i++) {
++        if (s_codec_slots[i].refs > 0 && s_codec_slots[i].handle == handle) {
++            last = (--s_codec_slots[i].refs == 0);
++            if (last) {
++                s_codec_slots[i].handle = NULL;
++            }
++            break;
++        }
++    }
++    portEXIT_CRITICAL(&s_codec_lock);
++    return last;
++}
++
+ bool audio_device_acquire(audio_device_t *dev)
+ {
+     if (!dev || dev->closed || dev->active) {
+@@ -73,24 +140,38 @@
+         .channel = dev->fmt.channels,
+         .bits_per_sample = dev->fmt.bits,
+     };
+-    bool arbiter_taken = false;
++    bool mic_taken = false;
++    bool spk_taken = false;
++
++    /* Take the device-level owner slot first: capture wins over the speaker,
++     * and a capture request makes new output opens fail here. */
+     if (dev->kind == AUDIO_DEVICE_INPUT) {
+         if (!ha_voice_arbiter_acquire(AUDIO_INPUT_ARBITER_TIMEOUT_MS)) {
+             ESP_LOGW(TAG, "Input open rejected: microphone busy");
+             return ESP_FAIL;
+         }
+-        arbiter_taken = true;
++        mic_taken = true;
++    } else {
++        if (!ha_voice_arbiter_spk_acquire(AUDIO_OUTPUT_ARBITER_TIMEOUT_MS)) {
++            ESP_LOGW(TAG, "Output open rejected: speaker revoked for capture");
++            return ESP_FAIL;
++        }
++        spk_taken = true;
+     }
+-    int ret = esp_codec_dev_open(dev->codec_dev, &fs);
+-    if (ret != ESP_CODEC_DEV_OK) {
+-        ESP_LOGE(TAG, "Codec open failed: role=%s rate=%" PRIu32 " ch=%u bits=%u ret=%d",
+-                 dev->kind == AUDIO_DEVICE_OUTPUT ? "output" : "input", dev->fmt.sample_rate, dev->fmt.channels, dev->fmt.bits, ret);
+-        if (arbiter_taken) {
+-            ha_voice_arbiter_release();
++
++    bool first_ref = audio_codec_ref_add(dev->codec_dev);
++    int ret = ESP_CODEC_DEV_OK;
++    if (first_ref) {
++        ret = esp_codec_dev_open(dev->codec_dev, &fs);
++        if (ret != ESP_CODEC_DEV_OK) {
++            ESP_LOGE(TAG, "Codec open failed: role=%s rate=%" PRIu32 " ch=%u bits=%u ret=%d",
++                     dev->kind == AUDIO_DEVICE_OUTPUT ? "output" : "input", dev->fmt.sample_rate, dev->fmt.channels, dev->fmt.bits, ret);
++            audio_codec_ref_remove(dev->codec_dev);
++            goto fail;
+         }
+-        return ESP_FAIL;
++        audio_device_refresh_actual_format(dev);
+     }
+-    audio_device_refresh_actual_format(dev);
++
+     if (dev->kind == AUDIO_DEVICE_OUTPUT) {
+         ret = esp_codec_dev_set_out_vol(dev->codec_dev, dev->volume);
+     } else {
+@@ -98,16 +179,56 @@
+     }
+     if (ret != ESP_CODEC_DEV_OK && ret != ESP_CODEC_DEV_NOT_SUPPORT) {
+         ESP_LOGE(TAG, "Codec level setup failed: role=%s ret=%d", dev->kind == AUDIO_DEVICE_OUTPUT ? "output" : "input", ret);
+-        esp_codec_dev_close(dev->codec_dev);
+-        if (arbiter_taken) {
+-            ha_voice_arbiter_release();
++        if (audio_codec_ref_remove(dev->codec_dev)) {
++            esp_codec_dev_close(dev->codec_dev);
+         }
+-        return ESP_FAIL;
++        goto fail;
+     }
++
++    dev->out_fmt = dev->fmt;
++    dev->decim_factor = 0;
+     dev->closed = false;
+     return ESP_OK;
++
++fail:
++    if (mic_taken) {
++        ha_voice_arbiter_release();
++    }
++    if (spk_taken) {
++        ha_voice_arbiter_spk_release();
++    }
++    return ESP_FAIL;
+ }
+ 
++/* Inputs are opened at the board codec format so the shared sample clock never
++ * has to change; read() delivers them downsampled to the requested ASR format
++ * instead. Returns 0 when there is nothing to convert. */
++static uint8_t audio_device_configure_downsample(audio_device_t *dev, uint32_t asr_rate, uint8_t asr_channels)
++{
++    if (dev->kind != AUDIO_DEVICE_INPUT || asr_rate == 0) {
++        return 0;
++    }
++    if (dev->fmt.bits != 16 || asr_channels != 1 ||
++        asr_rate > dev->fmt.sample_rate || dev->fmt.sample_rate % asr_rate != 0 ||
++        (dev->fmt.channels != 1 && dev->fmt.channels != 2)) {
++        ESP_LOGW(TAG, "Downsample request ignored: codec=%" PRIu32 "/%u/%u asr=%" PRIu32 "/%u",
++                 dev->fmt.sample_rate, dev->fmt.channels, dev->fmt.bits, asr_rate, asr_channels);
++        return 0;
++    }
++    int factor = (int)(dev->fmt.sample_rate / asr_rate);
++    if (factor == 1 && dev->fmt.channels == 1) {
++        return 0;
++    }
++    dev->out_fmt = dev->fmt;
++    dev->out_fmt.sample_rate = asr_rate;
++    dev->out_fmt.channels = asr_channels;
++    if (audio_format_complete(&dev->out_fmt) != ESP_OK) {
++        dev->out_fmt = dev->fmt;
++        return 0;
++    }
++    return (uint8_t)factor;
++}
++
+ static int lua_audio_new_device(lua_State *L, audio_device_kind_t kind)
+ {
+     luaL_checktype(L, 1, LUA_TTABLE);
+@@ -130,9 +251,14 @@
+     if (dev->volume < 0 || dev->volume > 100) {
+         return lua_audio_push_error(L, kind == AUDIO_DEVICE_OUTPUT ? "audio output: volume must be 0..100" : "audio input: volume must be 0..100");
+     }
++    /* Optional: deliver the input downsampled to these dimensions while the
++     * codec itself stays at the requested (board) format. */
++    uint32_t asr_rate = lua_audio_get_u32_field(L, 1, "asr_rate", 0, 0);
++    uint8_t asr_channels = lua_audio_get_u8_field(L, 1, "asr_channels", 0, 0);
+     if (audio_device_open(dev) != ESP_OK) {
+         return lua_audio_push_error(L, "audio device: failed to open codec");
+     }
++    dev->decim_factor = audio_device_configure_downsample(dev, asr_rate, asr_channels);
+ 
+     luaL_getmetatable(L, kind == AUDIO_DEVICE_OUTPUT ? AUDIO_DEVICE_OUTPUT_META : AUDIO_DEVICE_INPUT_META);
+     lua_setmetatable(L, -2);
+@@ -160,11 +286,15 @@
+         ESP_LOGW(TAG, "Device close rejected: busy holders=%u active=%d", dev->holders, dev->active);
+         return lua_audio_push_error(L, "audio device: busy");
+     }
+-    if (esp_codec_dev_close(dev->codec_dev) != ESP_CODEC_DEV_OK) {
+-        ESP_LOGW(TAG, "Codec close returned error");
++    if (audio_codec_ref_remove(dev->codec_dev)) {
++        if (esp_codec_dev_close(dev->codec_dev) != ESP_CODEC_DEV_OK) {
++            ESP_LOGW(TAG, "Codec close returned error");
++        }
+     }
+     if (dev->kind == AUDIO_DEVICE_INPUT) {
+         ha_voice_arbiter_release();
++    } else {
++        ha_voice_arbiter_spk_release();
+     }
+     dev->codec_dev = NULL;
+     dev->closed = true;
+@@ -176,9 +306,13 @@
+ {
+     audio_device_t *dev = (audio_device_t *)lua_touserdata(L, 1);
+     if (dev && !dev->closed && dev->holders == 0 && !dev->active) {
+-        esp_codec_dev_close(dev->codec_dev);
++        if (audio_codec_ref_remove(dev->codec_dev)) {
++            esp_codec_dev_close(dev->codec_dev);
++        }
+         if (dev->kind == AUDIO_DEVICE_INPUT) {
+             ha_voice_arbiter_release();
++        } else {
++            ha_voice_arbiter_spk_release();
+         }
+         dev->codec_dev = NULL;
+         dev->closed = true;
+@@ -197,13 +331,13 @@
+     lua_setfield(L, -2, "role");
+     lua_pushboolean(L, !dev->closed);
+     lua_setfield(L, -2, "opened");
+-    lua_pushinteger(L, dev->fmt.sample_rate);
++    lua_pushinteger(L, dev->out_fmt.sample_rate);
+     lua_setfield(L, -2, "sample_rate");
+-    lua_pushinteger(L, dev->fmt.channels);
++    lua_pushinteger(L, dev->out_fmt.channels);
+     lua_setfield(L, -2, "channels");
+-    lua_pushinteger(L, dev->fmt.bits);
++    lua_pushinteger(L, dev->out_fmt.bits);
+     lua_setfield(L, -2, "bits");
+-    lua_pushinteger(L, dev->fmt.bytes_per_frame);
++    lua_pushinteger(L, dev->out_fmt.bytes_per_frame);
+     lua_setfield(L, -2, "bytes_per_frame");
+     return 1;
+ }
+@@ -294,29 +428,63 @@
+     audio_device_t *dev = lua_audio_check_device(L, 1, AUDIO_DEVICE_INPUT, "read");
+     uint32_t bytes = 0;
+     uint8_t *buf = NULL;
++    uint8_t *out = NULL;
+ 
+     if (lua_istable(L, 2)) {
+         bytes = lua_audio_get_u32_field(L, 2, "bytes", 0, 0);
+     } else {
+         bytes = (uint32_t)luaL_checkinteger(L, 2);
+     }
++    if (bytes == 0) {
++        return lua_audio_push_error(L, "audio input: bytes must be positive");
++    }
+     if (!audio_device_acquire(dev)) {
+         return lua_audio_push_error(L, "audio input: busy");
+     }
+-    buf = malloc(bytes);
++
++    /* The codec runs at its native format; when the device delivers a smaller
++     * ASR format, read proportionally more frames and convert them below. */
++    uint32_t codec_bytes = bytes;
++    int out_samples = 0;
++    if (dev->decim_factor > 0) {
++        uint32_t out_frames = bytes / dev->out_fmt.bytes_per_frame;
++        if (out_frames == 0) {
++            audio_device_release(dev);
++            return lua_audio_push_error(L, "audio input: bytes smaller than one frame");
++        }
++        out_samples = (int)out_frames;
++        codec_bytes = out_frames * (uint32_t)dev->decim_factor * dev->fmt.bytes_per_frame;
++    }
++
++    buf = malloc(codec_bytes);
+     if (!buf) {
+         audio_device_release(dev);
+-        ESP_LOGE(TAG, "Input read buffer alloc failed: %" PRIu32 " bytes", bytes);
++        ESP_LOGE(TAG, "Input read buffer alloc failed: %" PRIu32 " bytes", codec_bytes);
+         return lua_audio_push_error(L, "audio input: out of memory");
+     }
+-    int ret = esp_codec_dev_read(dev->codec_dev, buf, (int)bytes);
++    int ret = esp_codec_dev_read(dev->codec_dev, buf, (int)codec_bytes);
+     audio_device_release(dev);
+     if (ret != ESP_CODEC_DEV_OK) {
+         free(buf);
+         ESP_LOGE(TAG, "Input read failed: ret=%d", ret);
+         return lua_audio_push_error(L, "audio input: read failed");
+     }
+-    lua_pushlstring(L, (const char *)buf, bytes);
++
++    if (out_samples > 0) {
++        uint32_t out_bytes = (uint32_t)out_samples * dev->out_fmt.bytes_per_frame;
++        out = malloc(out_bytes);
++        if (!out) {
++            free(buf);
++            ESP_LOGE(TAG, "Input read convert buffer alloc failed: %" PRIu32 " bytes", out_bytes);
++            return lua_audio_push_error(L, "audio input: out of memory");
++        }
++        ha_voice_pcm_downmix_decimate((const int16_t *)buf, out_samples, dev->fmt.channels,
++                                      (int)dev->decim_factor, (int16_t *)out);
++        lua_pushlstring(L, (const char *)out, out_bytes);
++        free(out);
++    } else {
++        lua_pushlstring(L, (const char *)buf, bytes);
++    }
+     free(buf);
+     return 1;
+ }
+diff --git a/components/lua_modules/lua_module_audio/src/audio_player.c b/components/lua_modules/lua_module_audio/src/audio_player.c
+--- a/components/lua_modules/lua_module_audio/src/audio_player.c
++++ b/components/lua_modules/lua_module_audio/src/audio_player.c
+@@ -5,6 +5,7 @@
+  */
+ #include "audio_private.h"
+ #include "cap_tts_stream.h"
++#include "ha_voice_arbiter.h"
+ 
+ static esp_err_t audio_player_create_converter(audio_player_t *player, const audio_format_t *src)
+ {
+@@ -92,6 +93,14 @@
+         ESP_LOGE(TAG, "Player output callback on invalid device");
+         return 0;
+     }
++    if (ha_voice_arbiter_spk_revoked()) {
++        /* A capture session is taking the shared codec: stop feeding the
++         * speaker so the recorder can reconfigure the sample clock. Returning 0
++         * lets esp_audio_simple_player wind down; Lua's poll() finishes the
++         * playback and releases the output device. */
++        ESP_LOGD(TAG, "Player aborted: speaker revoked for capture");
++        return 0;
++    }
+ 
+     xSemaphoreTake(player->lock, portMAX_DELAY);
+     if (!player->converter_ready) {

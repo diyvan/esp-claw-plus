@@ -25,6 +25,8 @@ local capability = require("capability")
 local tts = require("voice_tts")
 local vc = require("voice_common")
 local vstream = require("voice_stream")
+local playback = require("voice_playback")
+local round = require("voice_round")
 
 local TAG = "[voice_ptt]"
 
@@ -37,8 +39,9 @@ local READ_FRAMES = 1024   -- 每次读取的帧数 (48kHz 下约 21ms)
 local MIN_RECORD_MS = 500  -- 短于此时长视为误触, 丢弃
 local MAX_RECORD_MS = 10000 -- 上限, 避免一直按着写爆 /fatfs (3MB 分区)
 
--- 优先请求的采集格式: ASR 常用 16kHz 单声道, 数据量约为板级默认 48kHz 立体声的
--- 1/6, 大幅缩短 base64 编码与上传耗时; codec 不支持时回退板级默认格式。
+-- 交付给 ASR 的采集格式: ASR 常用 16kHz 单声道, 数据量约为板级默认 48kHz 立体声的
+-- 1/6, 大幅缩短 base64 编码与上传耗时。codec 仍以板级默认格式打开 (见 start_recording),
+-- 由 C 侧降采样产生该格式, 从而不重配与 DAC 共享的 I2S 时钟。
 local ASR_RATE = 16000
 local ASR_CHANNELS = 1
 
@@ -56,6 +59,12 @@ local STATUS_IDLE = "idle"
 local STATUS_HOLD_MS = 4000
 local REPLY_TIMEOUT_MS = 30000 -- 注入 Agent 后等待回复的上限, 超时提示「AI 无响应」
 local FINISH_TIMEOUT_MS = 6000 -- 流式 ASR: 收尾发末包后等待最终结果的上限
+
+-- 手动发送模式 (运行时配置 voice_send_mode="manual"): 识别出文本后不立即发送, 进入 "pending"
+-- 态等用户用 BOOT 键确认 —— 轻点 (未达阈值即松开) 发送; 按住 >= MANUAL_HOLD_MIN_MS 作废本次
+-- 结果并立即重录; 无操作 PENDING_TIMEOUT_MS 后自动作废 (不自动发送)。默认 auto (识别即发送)。
+local MANUAL_HOLD_MIN_MS = 500
+local PENDING_TIMEOUT_MS = 15000
 
 -- 语音会话所在渠道/会话, 必须与路由规则 voice_reply_run_script 的匹配条件一致
 local VOICE_CHANNEL = "voice"
@@ -159,7 +168,7 @@ end
 --       voice_asr_provider / voice_asr_resource_id /
 --       voice_tts_url / voice_tts_api_key / voice_tts_provider /
 --       voice_tts_resource_id / voice_tts_speaker / voice_reply_mode /
---       voice_tts_stream / ha_enabled / ha_base_url / ha_token
+--       voice_send_mode / voice_tts_stream / ha_enabled / ha_base_url / ha_token
 -- 说明: voice_enabled 是语音助手总开关, 关闭后 PTT 与唤醒词都停用。
 -- ---------------------------------------------------------------------------
 
@@ -182,6 +191,12 @@ local function reply_chat_id()
         return VOICE_CHAT_ID_DIRECT
     end
     return VOICE_CHAT_ID
+end
+
+-- 发送模式 (voice_send_mode): "manual" 时识别完成后进入 pending 态等 BOOT 确认, 其余 (含缺省
+-- 的 auto) 一律识别即发送。
+local function send_mode_manual()
+    return vc.runtime_config().voice_send_mode == "manual"
 end
 
 -- 估算一小段 16-bit 小端交织 PCM 的 RMS (每 4 帧取 1 帧, 限制 CPU 开销)。
@@ -431,11 +446,16 @@ local function inject_text(text)
 end
 
 -- ---------------------------------------------------------------------------
--- PTT 状态机: idle <-> recording
+-- PTT 状态机: idle <-> recording, 以及手动模式的 pending
 -- ---------------------------------------------------------------------------
-local state = "idle"          -- "idle" | "recording" | "waiting"
+local state = "idle"          -- "idle" | "recording" | "pending" | "waiting"
 local release_requested = false
 local rec = nil               -- { input, info, chunks, bytes, start_ms }
+
+-- 手动发送模式 pending 态: 已识别但未发送的文本, 进入时刻, 以及本次按下的时刻 (无则 nil)。
+local pending_text = nil
+local pending_since = nil
+local pending_press_ms = nil
 
 -- ---------------------------------------------------------------------------
 -- 句子级流式播报 (经 voice_stream 消费 /fatfs/voice_stream.txt)
@@ -446,7 +466,7 @@ local rec = nil               -- { input, info, chunks, bytes, start_ms }
 -- ---------------------------------------------------------------------------
 local WAIT_POLL_MS = 20            -- 等待态轮询间隔
 
-local reply_wait = nil             -- { stream, queue, player, output, played, deadline, tts_cfg }
+local reply_wait = nil             -- { stream, queue, pb, played, deadline, tts_cfg }
 
 local function trim(s)
     return (s:gsub("^%s+", ""):gsub("%s+$", ""))
@@ -461,22 +481,15 @@ local function play_sentence_stream(sentence)
     if not req then
         return false
     end
-    if reply_wait.stream_started and reply_wait.player then
-        if reply_wait.player:play_stream_append(req) then
+    if reply_wait.pb:stream_active() then
+        if reply_wait.pb:play_stream_append(req) then
             return true
         end
         print(TAG .. " play_stream_append failed")
         return false
     end
-    if not reply_wait.player then
-        reply_wait.player = audio.player({ output = reply_wait.output })
-    end
-    if not reply_wait.player then
-        return false
-    end
     vc.clear_interrupt()
-    if reply_wait.player:play_stream(req) then
-        reply_wait.stream_started = true
+    if reply_wait.pb:play_stream(req) then
         reply_wait.played = true
         set_status("speaking")
         return true
@@ -488,14 +501,14 @@ end
 -- 合成并异步播放一句 (按需创建 player)。
 local function play_sentence(sentence)
     sentence = trim(sentence)
-    if sentence == "" or not reply_wait.output then
+    if sentence == "" or not reply_wait.pb then
         return
     end
     if reply_wait.stream_enabled then
         if play_sentence_stream(sentence) then
             return
         end
-        if reply_wait.stream_started then
+        if reply_wait.pb:stream_active() then
             -- 流水线已建立却追加失败: 不混用落盘播放 (会打断在途音频), 丢弃该句。
             print(TAG .. " stream pipeline append failed, dropping sentence")
             return
@@ -506,10 +519,7 @@ local function play_sentence(sentence)
         return
     end
     vc.clear_interrupt()
-    if not reply_wait.player then
-        reply_wait.player = audio.player({ output = reply_wait.output })
-    end
-    if reply_wait.player and reply_wait.player:play(path) then
+    if reply_wait.pb:play_file(path) then
         reply_wait.played = true
         set_status("speaking")
     else
@@ -522,12 +532,9 @@ local function abort_reply_wait()
     if not reply_wait then
         return
     end
-    if reply_wait.player then
-        pcall(function() reply_wait.player:stop() end)
-        pcall(function() reply_wait.player:close() end)
-    end
-    if reply_wait.output then
-        pcall(function() reply_wait.output:close() end)
+    if reply_wait.pb then
+        reply_wait.pb:stop()
+        reply_wait.pb:close()
     end
     reply_wait = nil
 end
@@ -538,11 +545,8 @@ local function end_reply_wait()
         return
     end
     local played = reply_wait.played
-    if reply_wait.player then
-        pcall(function() reply_wait.player:close() end)
-    end
-    if reply_wait.output then
-        pcall(function() reply_wait.output:close() end)
+    if reply_wait.pb then
+        reply_wait.pb:close()
     end
     reply_wait = nil
     state = "idle"
@@ -561,9 +565,8 @@ local function arm_reply_wait()
     local wait = {
         stream = vstream.consumer({ root_dir = root_dir }),
         queue = {},
-        player = nil, output = nil, played = false,
+        pb = nil, played = false,
         stream_enabled = stream_enabled(),
-        stream_started = false,     -- 首句已建立分句流水线会话
         finish_sent = false,        -- 已通知流水线不再追加
         t_inject = system.millis(),
         first_sentence_ms = nil,
@@ -572,19 +575,9 @@ local function arm_reply_wait()
         tts_cfg = vc.runtime_config(),
     }
 
-    local codec, rate, channels, bits = bm.get_audio_codec_output_params("audio_dac")
-    if codec then
-        wait.output = audio.new_output({ codec, rate, channels, bits,
-            volume = tonumber(wait.tts_cfg and wait.tts_cfg.voice_volume) or 80 })
-    end
-    if wait.output then
-        wait.player = audio.player({ output = wait.output })
-        if not wait.player then
-            wait.output:close()
-            wait.output = nil
-        end
-    end
-    if not wait.player then
+    -- 播放 owner: 开 DAC 输出 (player 惰性创建, 首次播放才建)。
+    wait.pb = playback.open(wait.tts_cfg)
+    if not wait.pb then
         print(TAG .. " reply wait: audio output unavailable, stream playback disabled")
     end
     reply_wait = wait
@@ -597,20 +590,63 @@ local function start_reply_wait()
     state = "waiting"
 end
 
+-- 识别完成后的分流: 自动模式直接注入 Agent; 手动模式进入 pending 态等 BOOT 确认。
+local function handoff_recognized(text)
+    if send_mode_manual() then
+        pending_text = text
+        pending_since = system.millis()
+        pending_press_ms = nil
+        state = "pending"
+        set_status("confirming")
+        print(TAG .. " manual: awaiting confirm -> " .. text)
+        return
+    end
+    set_wait("thinking", REPLY_TIMEOUT_MS, "AI 无响应")
+    arm_reply_wait()
+    inject_text(text)
+    start_reply_wait()
+end
+
+-- 发送 pending 结果 (轻点确认): 与自动模式同一套注入 + 播报流程。
+local function send_pending()
+    local text = pending_text
+    pending_text, pending_since, pending_press_ms = nil, nil, nil
+    if not text or text == "" then
+        state = "idle"
+        return
+    end
+    print(TAG .. " manual: confirmed, sending -> " .. text)
+    set_wait("thinking", REPLY_TIMEOUT_MS, "AI 无响应")
+    arm_reply_wait()
+    inject_text(text)
+    start_reply_wait()
+end
+
+-- 作废 pending 结果 (按住重录 / 超时作废), 回空闲。
+local function discard_pending(reason)
+    pending_text, pending_since, pending_press_ms = nil, nil, nil
+    state = "idle"
+    print(TAG .. " manual: pending discarded (" .. tostring(reason) .. ")")
+    set_status(STATUS_IDLE)
+end
+
 -- 等待态主步骤: 推进播放 -> 读流文件切句 -> 起播下一句 -> 结束/超时/打断判定。
 local function wait_step()
     tick_status()
 
+    -- 防御: 等待态必须与等待对象同时存在。若上一轮等待被提前拆掉 (见 start_recording 的
+    -- 失败分支), 这里会处于 waiting 而 reply_wait==nil; 继续解引用会让常驻任务抛错退出,
+    -- 之后按键与唤醒词都无人响应、面板状态也卡住不动。此处直接归位空闲。
+    if not reply_wait then
+        print(TAG .. " wait state without reply context -> reset to idle")
+        state = "idle"
+        return
+    end
+
     local player_running = false
-    if reply_wait.player then
-        local st = reply_wait.player:poll()
-        player_running = (st and st.running) and true or false
-        if not player_running then
-            reply_wait.player:close()
-            reply_wait.player = nil
-            -- 流式会话随 player 一并结束: 若后续还有句子需重新起播 (会重新建会话)。
-            reply_wait.stream_started = false
-        elseif vc.interrupt_requested() then
+    if reply_wait.pb then
+        player_running = reply_wait.pb:poll()
+        if player_running and vc.interrupt_requested() then
             print(TAG .. " barge-in during stream playback -> stop")
             vc.clear_interrupt()
             abort_reply_wait()
@@ -639,9 +675,9 @@ local function wait_step()
             play_sentence(table.remove(reply_wait.queue, 1))
         end
         -- 文本已全部切句完毕: 通知流水线不再追加, 队列排空后自然收尾。
-        if reply_wait.stream:finished() and reply_wait.stream_started
-           and not reply_wait.finish_sent and reply_wait.player then
-            reply_wait.player:play_stream_finish()
+        if reply_wait.stream:finished() and reply_wait.pb and reply_wait.pb:stream_active()
+           and not reply_wait.finish_sent then
+            reply_wait.pb:play_stream_finish()
             reply_wait.finish_sent = true
         end
     elseif #reply_wait.queue > 0 and not player_running then
@@ -654,7 +690,8 @@ local function wait_step()
         print(string.format("%s timing: first_play=%dms", TAG, reply_wait.first_play_ms))
     end
 
-    if reply_wait.stream:finished() and not reply_wait.player and #reply_wait.queue == 0 then
+    if reply_wait.stream:finished() and #reply_wait.queue == 0
+       and (not reply_wait.pb or reply_wait.pb:idle()) then
         end_reply_wait()
         return
     end
@@ -717,10 +754,7 @@ local function finish_recording(ok, reason)
         end
         if text and text ~= "" then
             vc.log_user(text)
-            set_wait("thinking", REPLY_TIMEOUT_MS, "AI 无响应")
-            arm_reply_wait()
-            inject_text(text)
-            start_reply_wait()
+            handoff_recognized(text)
         else
             set_error(err or "识别失败")
         end
@@ -746,10 +780,7 @@ local function finish_recording(ok, reason)
     local text, err = asr_transcribe(storage.join_path(storage.get_root_dir(), "voice_ptt.wav"), info)
     if text and text ~= "" then
         vc.log_user(text)
-        set_wait("thinking", REPLY_TIMEOUT_MS, "AI 无响应")
-        arm_reply_wait()
-        inject_text(text)
-        start_reply_wait()
+        handoff_recognized(text)
     else
         set_error(err or "识别失败")
     end
@@ -831,8 +862,17 @@ end
 
 -- mode: "ptt" (按键) | "auto" (唤醒词触发)
 local function start_recording(mode)
+    -- 开新一轮: 递增跨脚本轮次号, 让上一轮尚在途的异步回复 (voice_reply.lua) 自行过期放弃。
+    local round_id = round.begin()
+    print(TAG .. " round " .. round_id .. " begin (" .. mode .. ")")
+
     -- 新一轮录音前先拆掉上一轮的流式播报 (停播 + 释放扬声器)。
     abort_reply_wait()
+
+    -- 拆掉等待态后立刻归位「空闲」: 下面任何一处提前 return (麦克风打开失败 / ASR 初始化
+    -- 失败) 都不会留下 "state=waiting 但 reply_wait=nil" 的错配, 从而避免主循环进入
+    -- wait_step 时崩溃、常驻任务退出 (那样面板会永久卡在「思考中」且无法再唤醒)。
+    state = "idle"
 
     local codec, rate, channels, bits = bm.get_audio_codec_input_params("audio_adc")
     if not codec then
@@ -841,14 +881,10 @@ local function start_recording(mode)
         return
     end
 
-    -- 优先请求 16kHz 单声道; codec/底层不支持时回退板级默认格式 (新的 new_input
-    -- 会重新配置 codec, 失败时已释放麦克风仲裁, 故可安全重试)。
-    local input = audio.new_input({ codec, ASR_RATE, ASR_CHANNELS, bits, volume = 80 })
-    if not input then
-        print(string.format("%s %dHz/%dch not supported, fallback to default %dHz/%dch",
-                            TAG, ASR_RATE, ASR_CHANNELS, rate, channels))
-        input = audio.new_input({ codec, rate, channels, bits, volume = 80 })
-    end
+    -- 以板级默认格式打开 codec: 与 AFE 监听、DAC 播放同频, 不重配共享 I2S 时钟;
+    -- 读取结果由 C 侧降采样到 asr_* 格式 (info() 报告降采样后的格式)。
+    local input = audio.new_input({ codec, rate, channels, bits,
+        asr_rate = ASR_RATE, asr_channels = ASR_CHANNELS, volume = 80 })
     if not input then
         print(TAG .. " open audio input failed")
         set_error("麦克风占用")
@@ -907,6 +943,12 @@ local function start_recording(mode)
 end
 
 local function on_press_down(evt)
+    if state == "pending" then
+        -- 手动模式确认手势: 先只记录按下时刻, 松开再判定 (轻点=发送 / 按住=重录)。
+        pending_press_ms = system.millis()
+        print(TAG .. " PTT down (pending confirm)")
+        return
+    end
     if state == "recording" then
         return
     end
@@ -923,11 +965,36 @@ local function on_press_down(evt)
 end
 
 local function on_press_up(evt)
+    if state == "pending" then
+        -- 未达按住阈值即松开 = 轻点确认, 发送本次识别结果。
+        pending_press_ms = nil
+        print(TAG .. " PTT up (pending confirm), sending")
+        send_pending()
+        return
+    end
     if state ~= "recording" then
         return
     end
     print(TAG .. " PTT up (event=" .. tostring(evt and evt.event) .. "), stopping")
     release_requested = true
+end
+
+-- pending 态主步骤: 按住达到阈值 -> 作废并立即重录; 无操作超时 -> 作废回空闲。
+local function pending_step()
+    tick_status()
+    if pending_press_ms then
+        if system.millis() - pending_press_ms >= MANUAL_HOLD_MIN_MS then
+            print(TAG .. " manual: held -> discard and re-record")
+            pending_text, pending_since, pending_press_ms = nil, nil, nil
+            state = "idle"
+            start_recording("ptt")
+            return
+        end
+    elseif system.millis() - pending_since >= PENDING_TIMEOUT_MS then
+        discard_pending("timeout")
+        return
+    end
+    delay.delay_ms(POLL_MS)
 end
 
 local handle, herr = button.new(PTT_GPIO, ACTIVE_LEVEL)
@@ -965,10 +1032,14 @@ local function consume_wake_trigger()
     return true
 end
 
-while true do
+-- 单步主循环: 由外层 before loop 用 pcall 包裹调用, 保证常驻任务不因单次异常退出。
+local function loop_step()
     button.dispatch()
     if state == "recording" then
         record_step()
+    elseif state == "pending" then
+        -- 手动模式: 等 BOOT 键确认 (轻点发送 / 按住重录 / 超时作废)。
+        pending_step()
     elseif consume_wake_trigger() then
         print(TAG .. " wake trigger detected -> auto record")
         vc.signal_interrupt()
@@ -980,5 +1051,19 @@ while true do
         -- 空闲时把到期的错误状态恢复成「空闲」, 然后按轮询间隔休眠。
         tick_status()
         delay.delay_ms(POLL_MS)
+    end
+end
+
+while true do
+    -- 常驻任务必须活着: 单步异常只记录并归位空闲, 绝不让 job 线程崩溃退出。
+    -- (job 一旦退出, 按键与唤醒词都将无人响应, 面板状态也会永久卡住。)
+    local step_ok, step_err = pcall(loop_step)
+    if not step_ok then
+        print(TAG .. " main loop error: " .. tostring(step_err))
+        abort_reply_wait()
+        rec = nil
+        state = "idle"
+        set_error("语音任务异常")
+        delay.delay_ms(200)
     end
 end

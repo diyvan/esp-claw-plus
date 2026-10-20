@@ -71,7 +71,7 @@ HA 面板与语音助手都是**基于 ESP-Claw 架构与规范新增的扩展**
 | 音频 | ES8311 编解码 + 板载贴片麦克风 + MX1.25 8Ω2W 喇叭座 | 唤醒拾音 / ASR 上行录音 / TTS 回复播放 |
 | 电源 | AXP2101 PMIC + 3.7V 锂电池接口 | 电池供电形态可选 |
 | 存储 | Micro SD(SDIO 3.0) | 可选:媒体资源、Agent 记忆备份 |
-| 按键 | PWR / RST / BOOT | BOOT 可复用为"一键说话"(PTT 备用触发) |
+| 按键 | PWR / RST / BOOT | PWR(接 GPIO49,高有效)单击切换**待机/唤醒**(仅熄屏;语音唤起自动恢复运行,长按交给 PMIC 6s 关机不触发息屏);BOOT 可复用为"一键说话"(PTT 备用触发) |
 | 其他 | MIPI-CSI、MIPI-DSI 预留、USB OTG 2.0 HS | 本方案不用;USB OTG 后续可接 HID |
 
 ---
@@ -262,7 +262,7 @@ ESP-Claw 与小智都是**完整应用框架**(各自拥有 main、任务模型�
 | 里程碑 | 内容 | 交付/验收 |
 |---|---|---|
 | **M0 基座验证** | ✅ 全部完成:① 仿 `waveshare_esp32_p4_nano` 写本板 esp-claw 板级 YAML;② 核实 IDF v6.1 兼容性;③ esp-sr 共存编译;④ 固件体积核算;⑤ 真机跑通 Agent Loop + IM 对话、记录内存水位、回归既有示例 | **结论:[docs/m0-verification.md](docs/m0-verification.md)** — IDF v6.1 可直接构建(仅需 `json`→`cjson`);esp-sr master 可共存;app 3.22MB(余 20%);真机 heap/PSRAM 水位见 §5.5 |
-| **M1 面板上屏** | 基座接入 ST7796 + FT6336(LVGL 挂载到其应用层);HA WebSocket client(令牌认证、状态订阅)<br>✅ 第一阶段完成:C 应用层自建 LVGL 面板接管屏幕(`main/ha_panel.c`),真机目视通过<br>✅ 设备端界面基座化:面板升级为**底部分页菜单**(面板 / 语音 / 设备信息);设备页展示网络/LLM/IM/语音**系统状态**<br>✅ 去 mock:面板页不再用 mock 实体,改为 HA 链接状态;语音 ASR/TTS 占位一并移除<br>✅ 配置基座化:HA 地址/令牌 + `ha_enabled` 走 ESP-Claw 网页配置(`app_config` + `/api/config` + 前端 HA/语音配置页)<br>🔄 待接真实 HA WebSocket | 屏上看到米家实体卡片并能开关灯;HA 地址/令牌/开关在 ESP-Claw 网页配置 |
+| **M1 面板上屏** | 基座接入 ST7796 + FT6336(LVGL 挂载到其应用层);HA WebSocket client(令牌认证、状态订阅)<br>✅ 第一阶段完成:C 应用层自建 LVGL 面板接管屏幕(`main/ha_panel.c`),真机目视通过<br>✅ 设备端界面基座化:面板升级为**底部分页菜单**(面板 / 语音 / 设备信息);设备页展示网络/LLM/IM/语音**系统状态**<br>✅ 去 mock:面板页不再用 mock 实体,改为 HA 链接状态;语音 ASR/TTS 占位一并移除<br>✅ 配置基座化:HA 地址/令牌 + `ha_enabled` 走 ESP-Claw 网页配置(`app_config` + `/api/config` + 前端 HA/语音配置页)<br>✅ 待机:电源键(PWR→GPIO49,高有效)单击熄屏/单击恢复(`main/ha_panel_power.c`),仅关背光并暂停渲染与触摸,系统/Wi-Fi/语音全程在线<br>🔄 待接真实 HA WebSocket | 屏上看到米家实体卡片并能开关灯;HA 地址/令牌/开关在 ESP-Claw 网页配置 |
 | **M2 AI 执行落米家** | esp-claw MCP Client 对接 HA MCP Server;Lua 规则引擎跑 1-2 条本地联动;实现 `ha_enabled` 意图路由(启用时 LLM 判定是否需要 HA,关闭时纯 ESP-Claw)<br>✅ 代码完成:`ha_control` 技能(经 `cap_mcp_client` 调 HA MCP,新增 `bearer_token` 支持,受 `ha_enabled` 门控)+ `local_scene` 离线联动(2 条路由规则)+ MCP 令牌补丁<br>🔄 待 HA 实例真机对接(本里程碑按要求**只落代码逻辑,暂不做实际测试**) | AI/触摸/规则三条控制路径全通;拔路由器后 Lua 规则仍触发 |
 | **M3 语音管线(V1)** | esp-sr 唤醒跑通;录音 → 云 ASR → 渠道层进 Agent → TTS 播放;多轮与打断打磨<br>✅ 第一阶段完成:BOOT 键 PTT(录音→注入渠道层)+ Agent 回复回传(`out_message`→路由规则→Lua 播报)双向链路真机跑通<br>✅ 语音配置基座化:ASR/TTS 端点与密钥、唤醒开关走网页配置,经 `/fatfs/ha_voice_runtime.json` 桥即存即用<br>✅ 真实云调用已实现:`voice_ptt.lua` base64+JSON 上传 ASR、`voice_reply.lua` 经 `save_path` 落盘音频再播放;含语音打断(barge-in)<br>🔄 待云 ASR/TTS 凭据 + 唤醒词真机联调 | "说一句话 → Agent 多步执行 → 屏幕显示结果";唤醒到响应 P95 延迟达标(§10) |
 | **M4 体验打磨与发布** | 误唤醒/打断/延迟优化;(可选)IM 渠道、MCP Server 暴露板载能力、SD 记忆备份;若 V1 语音不达标则评估启动 V2<br>✅ 语音打断已落地(`/fatfs/voice_interrupt` 标志:说话即停 TTS);文档已同步(SKILL/README/voice-integration)<br>🔄 长跑稳定性、误唤醒率、延迟优化待真机数据;IM 渠道 / MCP Server / SD 备份仍为可选未启动 | 稳定性长跑(≥48h 无重启);文档收尾 |
@@ -284,12 +284,12 @@ solutions/ha_ai_panel/
 │   ├── install_voice_rules.py   # 经串口 REPL 安装语音 + 本地联动路由规则(event_router --add-rule-json)
 │   ├── flash_verify.sh          # 构建+烧录+抓串口日志一条龙(沙箱外跑, 用法: flash_verify.sh [build|flash|log|all])
 │   └── check_idf_regression.sh  # 报告 IDF 补丁状态 + 用既有示例做回归构建
-├── patches/                     # esp-claw-idf6.patch、esp-claw-m1-panel.patch、esp-claw-ha-config.patch(HA 地址/令牌配置)、esp-claw-ha-voice-config.patch(HA 启用开关 + 语音 ASR/TTS/唤醒字段)、esp-claw-ha-mcp-token.patch(MCP client 支持 bearer_token)
+├── patches/                     # esp-claw-idf6.patch、esp-claw-m1-panel.patch、esp-claw-ha-config.patch(HA 地址/令牌配置)、esp-claw-ha-voice-config.patch(HA 启用开关 + 语音 ASR/TTS/唤醒字段)、esp-claw-ha-mcp-token.patch(MCP client 支持 bearer_token)、esp-claw-audio-owner.patch(C 层 ha_voice_arbiter 扩 MIC/SPK 双向所有权 + 48k 采集不变量,见 docs/adr/0003)、esp-claw-voice-send-mode.patch(语音发送模式 manual)
 ├── app/
 │   ├── application/edge_agent/main/   # 应用层叠加:ha_panel.c/h(M1 自建 LVGL 分页面板 + 运行时配置桥 ha_panel_publish_runtime_config)
 │   ├── application/edge_agent/components/http_server/frontend_source/  # 前端叠加:HA/语音配置页(client.ts/pages/i18n + 重建 dist/index.html.gz)
 │   ├── application/edge_agent/fatfs_image/system/skills/
-│   │   ├── voice/             # 语音技能(SKILL.md + voice_ptt/reply/selftest.lua + providers/ 供应商适配层,读运行时 JSON 配置)
+│   │   ├── voice/             # 语音技能(SKILL.md + voice_ptt/reply/selftest.lua + 共享模块 voice_common/voice_stream/voice_tts/voice_playback/voice_round.lua + providers/ 供应商适配层,读运行时 JSON 配置)
 │   │   ├── ha_control/        # HA MCP 控制(ha_list_tools.lua / ha_call.lua,受 ha_enabled 门控)
 │   │   └── local_scene/       # 离线本地场景联动(local_scene.lua,断网可用)
 │   └── router_rules/          # 路由规则源:voice_rules.json + local_rules.json
